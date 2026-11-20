@@ -1,0 +1,8 @@
+{
+  "name": "stift",
+  "version": "0.3.0-alpha.1",
+  "description": "Comment on your running web app in the browser; this Claude Code session makes each change, one at a time. Every change can be reverted or redone without touching your Git state.",
+  "author": {
+    "name": "Philipp"
+  }
+}

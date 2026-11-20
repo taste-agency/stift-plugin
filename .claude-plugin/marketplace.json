@@ -1,0 +1,12 @@
+{
+  "name": "stift",
+  "owner": { "name": "Philipp" },
+  "metadata": { "description": "stift: comment on your running web app; each comment becomes a change by your Claude Code session." },
+  "plugins": [
+    {
+      "name": "stift",
+      "source": "./packages/claude-plugin",
+      "description": "Comment on your running web app (Vite or Next.js) in the browser; this session makes each change, one at a time. /stift:setup adds the dev-only integration, /stift:start listens."
+    }
+  ]
+}
