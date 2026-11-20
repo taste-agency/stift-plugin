@@ -26,4 +26,4 @@ PostHog, on its EU cloud (Frankfurt).
 
 ## Questions or deletion
 
-Email [email] to ask what we hold about you or to have it deleted.
+Email hello@tasteand.agency to ask what we hold about you or to have it deleted.
