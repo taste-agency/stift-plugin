@@ -252,6 +252,31 @@ var Changes = class {
 		rel = rel.split(path.sep).join("/");
 		return rel === ".git" || rel.startsWith(".git/") ? null : rel;
 	}
+	/**
+	* Which of these files stift may write by itself (a text edit from the page): inside the working tree, not in .git
+	* or node_modules, and not ignored by Git. Ignored files hold what never shows in a commit (the dev-only `.stift/`
+	* adapter, .env.local, local settings), so a change there would go unseen. Returns them repository-relative.
+	*/
+	editable(files) {
+		const rels = /* @__PURE__ */ new Map();
+		for (const f of files) {
+			const rel = this.relPath(f);
+			if (rel && !/(^|\/)node_modules\//.test(rel) && !/[\0\n]/.test(rel)) rels.set(rel, f);
+		}
+		if (!rels.size) return /* @__PURE__ */ new Map();
+		const r = this.git([
+			"check-ignore",
+			"-z",
+			"--stdin"
+		], {
+			input: [...rels.keys()].join("\0") + "\0",
+			allowFail: true,
+			env: { GIT_LITERAL_PATHSPECS: "0" }
+		});
+		if (r.status !== 0 && r.status !== 1) return /* @__PURE__ */ new Map();
+		for (const rel of splitZ(r.stdout)) rels.delete(rel);
+		return new Map([...rels].map(([rel, f]) => [f, rel]));
+	}
 	/** `index`: 'scratch' for stift's private index, 'user' for the user's own (.git/index), else none written. */
 	git(args, o = {}) {
 		const index = o.index === "scratch" ? path.join(this.dir, "index") : void 0;
@@ -562,14 +587,28 @@ var Changes = class {
 	registerComment(comment) {
 		writeJson(path.join(this.dir, "comments", `${hash(comment.id)}.json`), comment);
 	}
-	/** The comment the main agent works on now: the hook records its edits under it. Set by the bridge. */
-	setActive(id) {
+	/**
+	* The comment the main agent works on now: the hook records its edits under it. Set by the bridge. `session`: the
+	* Claude Code session that has it, so another session editing in the same checkout isn't recorded.
+	*/
+	setActive(id, session) {
 		const file = path.join(this.dir, "active.json");
-		if (id) writeJson(file, { id });
+		if (id) writeJson(file, {
+			id,
+			...session ? { session } : {}
+		});
 		else fs.rmSync(file, { force: true });
 	}
-	active() {
-		return readJson(path.join(this.dir, "active.json"))?.id ?? null;
+	/** The active comment, for a hook of `session`: null when none is active, or another session has it. */
+	active(session) {
+		const a = readJson(path.join(this.dir, "active.json"));
+		if (!a?.id || a.session && session && a.session !== session) return null;
+		return a.id;
+	}
+	/** Whether the active comment is in another session's hands than `session`. */
+	othersActive(session) {
+		const a = readJson(path.join(this.dir, "active.json"));
+		return !!a?.id && !!a.session && !!session && a.session !== session;
 	}
 	/** Links a comment to the agent that makes it. */
 	begin(taskId, agentId, comment) {
@@ -945,11 +984,14 @@ function handleHook(input) {
 	if (input.agent_id || !EDIT_TOOLS.has(input.tool_name ?? "") || typeof file !== "string") return;
 	const ch = new Changes(input.cwd ?? process.cwd());
 	if (input.hook_event_name === "PreToolUse") {
-		const active = ch.active();
+		const active = ch.active(input.session_id);
 		if (!active) return;
 		ch.begin(active, MAIN_AGENT);
 		ch.recordEdit(MAIN_AGENT, file);
-	} else if (input.hook_event_name === "PostToolUse" || input.hook_event_name === "PostToolUseFailure") ch.finishEdit(MAIN_AGENT, file);
+	} else if (input.hook_event_name === "PostToolUse" || input.hook_event_name === "PostToolUseFailure") {
+		if (ch.othersActive(input.session_id)) return;
+		ch.finishEdit(MAIN_AGENT, file);
+	}
 }
 // packages/claude-plugin/src/claude/hook.ts
 let input;

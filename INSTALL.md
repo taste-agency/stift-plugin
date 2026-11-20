@@ -44,7 +44,7 @@ If installing or updating fails or keeps hitting permission or sandbox errors, s
 
 If `/stift:setup` is available in this conversation, follow it. A plugin installed or updated in step 1 loads only in the next conversation or after `/reload-plugins`, so otherwise do the same from the command line:
 
-1. From the project root, run `node STIFT/packages/claude-plugin/dist/stift.mjs setup` (add `--dir <app>` in a monorepo when it asks). It detects Vite or Next.js, copies a dev-only adapter into `<app>/stift/`, wraps the Vite or Next.js config, and allows the stift tools in `.claude/settings.local.json`.
+1. From the project root, run `node STIFT/packages/claude-plugin/dist/stift.mjs setup` (add `--dir <app>` in a monorepo when it asks). It detects Vite or Next.js, copies a dev-only adapter into `<app>/.stift/` (moving an older `<app>/stift/` there), wraps the Vite or Next.js config, and allows the stift tools in `.claude/settings.local.json`.
    - Exit 0: done. Exit 2: make the `TODO` edits it prints yourself, keeping them dev only.
    - Exit 1 with "No Vite or Next.js app found": tell the person stift supports React apps on Vite or Next.js for now, and stop.
    - When it printed a `Telemetry:` line (not "Telemetry is off."), ask the person this one question, with "Yes" as the first, preselected option: "Help improve stift by sharing what you ask for? stift would send your comment text, Claude's summaries and its tool calls, which can include code from this repository, to the stift team, who may use it to improve and train models. Usage and structure are sent either way. Details: https://getstift.vercel.app/telemetry.md" Options: "Yes, share it" and "No". Record the answer with `node STIFT/packages/claude-plugin/dist/stift.mjs telemetry --content yes` (or `no`).
@@ -59,7 +59,7 @@ In a few lines, with the app's URL:
 - This conversation now listens for their changes (step 4). Every change needs a listening Claude Code session: if they close it, they run `/stift:start` in a new conversation in this project. Changes they make while no session listens are collected (the bar says "Not connected"); when a session connects again, stift asks them whether to apply them.
 - The bar's change count opens the list of changes; click one to jump to it.
 - Each comment becomes a commit on their feature branch (a comment on the base branch starts one, named after it). Cmd+Z on the page or "undo the last change" in the session undoes the newest. Their own uncommitted edits stay uncommitted. The shelf on stift's bar lists their features; Review pushes the branch and opens or updates its pull request.
-- What changed in the project (`git status --short`): the `stift/` folder and the config line are dev only; production builds don't include them. The integration stays local to their machine: `stift/` is excluded in `.git/info/exclude`, the config edit stays an uncommitted change that rides along across branch switches, and stift never puts either into a comment commit, a Review push or a pull request.
+- What changed in the project (`git status --short`): the `.stift/` folder and the config line are dev only; production builds don't include them. The integration stays local to their machine: `.stift/` is excluded in `.git/info/exclude`, the config edit stays an uncommitted change that rides along across branch switches, and stift never puts either into a comment commit, a Review push or a pull request.
 
 ## 4. Start listening
 

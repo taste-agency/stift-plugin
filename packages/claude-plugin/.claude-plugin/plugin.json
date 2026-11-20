@@ -1,6 +1,6 @@
 {
   "name": "stift",
-  "version": "0.3.0-alpha.5",
+  "version": "0.3.0-alpha.6",
   "description": "Comment on your running web app in the browser; this Claude Code session makes each change, one at a time. Each comment becomes a commit on your feature branch; the newest can be undone, and your own uncommitted edits stay uncommitted.",
   "author": {
     "name": "Philipp"

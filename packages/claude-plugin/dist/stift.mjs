@@ -260,6 +260,31 @@ var Changes = class {
 		rel = rel.split(path.sep).join("/");
 		return rel === ".git" || rel.startsWith(".git/") ? null : rel;
 	}
+	/**
+	* Which of these files stift may write by itself (a text edit from the page): inside the working tree, not in .git
+	* or node_modules, and not ignored by Git. Ignored files hold what never shows in a commit (the dev-only `.stift/`
+	* adapter, .env.local, local settings), so a change there would go unseen. Returns them repository-relative.
+	*/
+	editable(files) {
+		const rels = /* @__PURE__ */ new Map();
+		for (const f of files) {
+			const rel = this.relPath(f);
+			if (rel && !/(^|\/)node_modules\//.test(rel) && !/[\0\n]/.test(rel)) rels.set(rel, f);
+		}
+		if (!rels.size) return /* @__PURE__ */ new Map();
+		const r = this.git([
+			"check-ignore",
+			"-z",
+			"--stdin"
+		], {
+			input: [...rels.keys()].join("\0") + "\0",
+			allowFail: true,
+			env: { GIT_LITERAL_PATHSPECS: "0" }
+		});
+		if (r.status !== 0 && r.status !== 1) return /* @__PURE__ */ new Map();
+		for (const rel of splitZ(r.stdout)) rels.delete(rel);
+		return new Map([...rels].map(([rel, f]) => [f, rel]));
+	}
 	/** `index`: 'scratch' for stift's private index, 'user' for the user's own (.git/index), else none written. */
 	git(args, o = {}) {
 		const index = o.index === "scratch" ? path.join(this.dir, "index") : void 0;
@@ -570,14 +595,28 @@ var Changes = class {
 	registerComment(comment) {
 		writeJson(path.join(this.dir, "comments", `${hash(comment.id)}.json`), comment);
 	}
-	/** The comment the main agent works on now: the hook records its edits under it. Set by the bridge. */
-	setActive(id) {
+	/**
+	* The comment the main agent works on now: the hook records its edits under it. Set by the bridge. `session`: the
+	* Claude Code session that has it, so another session editing in the same checkout isn't recorded.
+	*/
+	setActive(id, session) {
 		const file = path.join(this.dir, "active.json");
-		if (id) writeJson(file, { id });
+		if (id) writeJson(file, {
+			id,
+			...session ? { session } : {}
+		});
 		else fs.rmSync(file, { force: true });
 	}
-	active() {
-		return readJson(path.join(this.dir, "active.json"))?.id ?? null;
+	/** The active comment, for a hook of `session`: null when none is active, or another session has it. */
+	active(session) {
+		const a = readJson(path.join(this.dir, "active.json"));
+		if (!a?.id || a.session && session && a.session !== session) return null;
+		return a.id;
+	}
+	/** Whether the active comment is in another session's hands than `session`. */
+	othersActive(session) {
+		const a = readJson(path.join(this.dir, "active.json"));
+		return !!a?.id && !!a.session && !!session && a.session !== session;
 	}
 	/** Links a comment to the agent that makes it. */
 	begin(taskId, agentId, comment) {
@@ -13023,15 +13062,38 @@ function detect(dir) {
 }
 const NEXT_DTS = `// Types for stift-next.cjs (stift, dev only).\ndeclare const stift: { withStift<T>(config: T, options?: { allowOrigins?: string[] }): any }\nexport = stift\n`;
 const VITE_DTS = `// Types for vite.mjs (stift, dev only).\nimport type { Plugin } from 'vite'\nexport default function stift(options?: { allowOrigins?: string[] }): Plugin\n`;
-/** Copies the adapter into `<app>/stift/` and wraps the config. Returns what it did, and what the agent must still do. */
+/** Copies the adapter into `<app>/.stift/` and wraps the config. Returns what it did, and what the agent must still do. */
 function setup(dir) {
 	const f = detect(dir);
 	if (!f.name) throw new Error(f.reason);
 	const done = [];
 	const todo = [];
-	const folder = path.join(f.app, "stift");
-	fs.mkdirSync(folder, { recursive: true });
 	const rel = (p) => path.relative(dir, p) || ".";
+	let folder = path.join(f.app, ".stift");
+	const old = path.join(f.app, "stift");
+	const adapter = ["next.cjs", "vite.mjs"].find((n) => {
+		try {
+			return fs.readFileSync(path.join(old, n), "utf8").includes(n === "next.cjs" ? "withStift" : "/@stift/overlay.js");
+		} catch {
+			return false;
+		}
+	});
+	if (adapter && tracked(dir, old)) folder = old;
+	else if (adapter) {
+		fs.rmSync(folder, {
+			recursive: true,
+			force: true
+		});
+		fs.renameSync(old, folder);
+		unexcludeLocally(dir, old);
+		if (f.config) {
+			const src = fs.readFileSync(f.config, "utf8");
+			fs.writeFileSync(f.config, src.replace(/(['"])\.\/stift\/(next\.cjs|vite\.mjs)\1/g, "$1./.stift/$2$1"));
+		}
+		done.push(`Moved ${rel(old)}/ to ${rel(folder)}/${f.config ? ` and updated the import in ${rel(f.config)}` : ""}.`);
+	}
+	fs.mkdirSync(folder, { recursive: true });
+	const imp = `./${path.basename(folder)}/${f.name === "next" ? "next.cjs" : "vite.mjs"}`;
 	if (f.name === "next") {
 		fs.copyFileSync(asset("stift-next.cjs"), path.join(folder, "next.cjs"));
 		fs.writeFileSync(path.join(folder, "next.d.cts"), NEXT_DTS);
@@ -13059,7 +13121,7 @@ function setup(dir) {
 	} catch {}
 	const read = devWorkflow(dir, f.app, done);
 	if (!f.config) {
-		todo.push(f.name === "next" ? `Create next.config.ts in ${rel(f.app)} with: import stift from "./stift/next.cjs"; export default stift.withStift({});` : `Add the plugin to the Vite config in ${rel(f.app)}: import stift from './stift/vite.mjs', then plugins: [stift(), …].`);
+		todo.push(f.name === "next" ? `Create next.config.ts in ${rel(f.app)} with: import stift from "${imp}"; export default stift.withStift({});` : `Add the plugin to the Vite config in ${rel(f.app)}: import stift from '${imp}', then plugins: [stift(), …].`);
 		return {
 			framework: f,
 			done,
@@ -13068,7 +13130,7 @@ function setup(dir) {
 		};
 	}
 	const src = fs.readFileSync(f.config, "utf8");
-	if (/stift\/(next\.cjs|vite\.mjs)/.test(src)) {
+	if (src.includes(imp)) {
 		done.push(`${rel(f.config)} already uses stift.`);
 		return {
 			framework: f,
@@ -13081,18 +13143,18 @@ function setup(dir) {
 	const { q, semi } = styleOf(src);
 	let out = null;
 	if (f.name === "next") {
-		if (cjs) out = src.replace(/module\.exports\s*=\s*([^;\n]+);?\s*$/m, (_m, e) => `module.exports = require(${q}./stift/next.cjs${q}).withStift(${e.trim()})${semi}\n`);
+		if (cjs) out = src.replace(/module\.exports\s*=\s*([^;\n]+);?\s*$/m, (_m, e) => `module.exports = require(${q}${imp}${q}).withStift(${e.trim()})${semi}\n`);
 		else {
 			const m = [...src.matchAll(/^export default ([^;\n]+);?[ \t]*$/gm)].at(-1);
-			if (m && balanced(m[1])) out = addImport(src.slice(0, m.index) + `export default stift.withStift(${m[1].trim()})${semi}` + src.slice(m.index + m[0].length), `import stift from ${q}./stift/next.cjs${q}${semi}`);
+			if (m && balanced(m[1])) out = addImport(src.slice(0, m.index) + `export default stift.withStift(${m[1].trim()})${semi}` + src.slice(m.index + m[0].length), `import stift from ${q}${imp}${q}${semi}`);
 		}
-	} else if (!cjs && /plugins\s*:\s*\[/.test(src)) out = addImport(src.replace(/plugins\s*:\s*\[/, (m) => `${m}stift(), `), `import stift from ${q}./stift/vite.mjs${q}${semi}`);
+	} else if (!cjs && /plugins\s*:\s*\[/.test(src)) out = addImport(src.replace(/plugins\s*:\s*\[/, (m) => `${m}stift(), `), `import stift from ${q}${imp}${q}${semi}`);
 	if (out && out !== src) {
 		fs.writeFileSync(f.config, out);
 		done.push(`Wrapped the config in ${rel(f.config)} (${f.name === "next" ? "stift.withStift(…), a no-op outside next dev" : "stift() with apply: 'serve', not part of vite build"}).`);
 		const formatted = format(f.app, gitTop(dir), [f.config]);
 		if (formatted) done.push(formatted);
-	} else todo.push(f.name === "next" ? `Edit ${rel(f.config)} by hand: import stift from "./stift/next.cjs", and export stift.withStift(<your config>) as the default.` : `Edit ${rel(f.config)} by hand: import stift from './stift/vite.mjs', and put stift() first in plugins.`);
+	} else todo.push(f.name === "next" ? `Edit ${rel(f.config)} by hand: import stift from "${imp}", and export stift.withStift(<your config>) as the default.` : `Edit ${rel(f.config)} by hand: import stift from '${imp}', and put stift() first in plugins.`);
 	return {
 		framework: f,
 		done,
@@ -13127,17 +13189,7 @@ function allowTools(dir) {
 * tracked. Nothing in the repository changes. Returns whether it is excluded now.
 */
 function excludeLocally(dir, file, folder = false) {
-	try {
-		execFileSync("git", [
-			"ls-files",
-			"--error-unmatch",
-			file
-		], {
-			cwd: dir,
-			stdio: "ignore"
-		});
-		return false;
-	} catch {}
+	if (tracked(dir, file)) return false;
 	try {
 		execFileSync("git", [
 			"check-ignore",
@@ -13166,6 +13218,40 @@ function excludeLocally(dir, file, folder = false) {
 	} catch {
 		return false;
 	}
+}
+/** Whether Git tracks the file, or a file in the folder. */
+function tracked(dir, file) {
+	try {
+		execFileSync("git", [
+			"ls-files",
+			"--error-unmatch",
+			file
+		], {
+			cwd: dir,
+			stdio: "ignore"
+		});
+		return true;
+	} catch {
+		return false;
+	}
+}
+/** Takes the folder's line, as excludeLocally wrote it, back out of .git/info/exclude. */
+function unexcludeLocally(dir, folder) {
+	try {
+		const exclude = execFileSync("git", [
+			"rev-parse",
+			"--path-format=absolute",
+			"--git-path",
+			"info/exclude"
+		], {
+			cwd: dir,
+			encoding: "utf8"
+		}).trim();
+		const line = `/${path.relative(fs.realpathSync(gitTop(dir)), path.join(fs.realpathSync(path.dirname(folder)), path.basename(folder)))}/`;
+		const had = fs.readFileSync(exclude, "utf8");
+		const kept = had.split("\n").filter((l) => l !== line).join("\n");
+		if (kept !== had) fs.writeFileSync(exclude, kept);
+	} catch {}
 }
 /** Whether a one-line expression closes every bracket it opens (`{` alone starts a multi-line object). */
 /**

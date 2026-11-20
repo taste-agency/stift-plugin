@@ -263,6 +263,31 @@ var Changes = class {
 		rel = rel.split(path.sep).join("/");
 		return rel === ".git" || rel.startsWith(".git/") ? null : rel;
 	}
+	/**
+	* Which of these files stift may write by itself (a text edit from the page): inside the working tree, not in .git
+	* or node_modules, and not ignored by Git. Ignored files hold what never shows in a commit (the dev-only `.stift/`
+	* adapter, .env.local, local settings), so a change there would go unseen. Returns them repository-relative.
+	*/
+	editable(files) {
+		const rels = /* @__PURE__ */ new Map();
+		for (const f of files) {
+			const rel = this.relPath(f);
+			if (rel && !/(^|\/)node_modules\//.test(rel) && !/[\0\n]/.test(rel)) rels.set(rel, f);
+		}
+		if (!rels.size) return /* @__PURE__ */ new Map();
+		const r = this.git([
+			"check-ignore",
+			"-z",
+			"--stdin"
+		], {
+			input: [...rels.keys()].join("\0") + "\0",
+			allowFail: true,
+			env: { GIT_LITERAL_PATHSPECS: "0" }
+		});
+		if (r.status !== 0 && r.status !== 1) return /* @__PURE__ */ new Map();
+		for (const rel of splitZ(r.stdout)) rels.delete(rel);
+		return new Map([...rels].map(([rel, f]) => [f, rel]));
+	}
 	/** `index`: 'scratch' for stift's private index, 'user' for the user's own (.git/index), else none written. */
 	git(args, o = {}) {
 		const index = o.index === "scratch" ? path.join(this.dir, "index") : void 0;
@@ -573,14 +598,28 @@ var Changes = class {
 	registerComment(comment) {
 		writeJson(path.join(this.dir, "comments", `${hash(comment.id)}.json`), comment);
 	}
-	/** The comment the main agent works on now: the hook records its edits under it. Set by the bridge. */
-	setActive(id) {
+	/**
+	* The comment the main agent works on now: the hook records its edits under it. Set by the bridge. `session`: the
+	* Claude Code session that has it, so another session editing in the same checkout isn't recorded.
+	*/
+	setActive(id, session) {
 		const file = path.join(this.dir, "active.json");
-		if (id) writeJson(file, { id });
+		if (id) writeJson(file, {
+			id,
+			...session ? { session } : {}
+		});
 		else fs.rmSync(file, { force: true });
 	}
-	active() {
-		return readJson(path.join(this.dir, "active.json"))?.id ?? null;
+	/** The active comment, for a hook of `session`: null when none is active, or another session has it. */
+	active(session) {
+		const a = readJson(path.join(this.dir, "active.json"));
+		if (!a?.id || a.session && session && a.session !== session) return null;
+		return a.id;
+	}
+	/** Whether the active comment is in another session's hands than `session`. */
+	othersActive(session) {
+		const a = readJson(path.join(this.dir, "active.json"));
+		return !!a?.id && !!a.session && !!session && a.session !== session;
 	}
 	/** Links a comment to the agent that makes it. */
 	begin(taskId, agentId, comment) {
@@ -1879,13 +1918,14 @@ function applyTextEdit(cl, e) {
 		reason: "the new text has characters that need escaping",
 		searched: 0
 	};
-	const starts = e.files.map((f) => path.resolve(cl.top, f)).filter((f) => fs.existsSync(f));
+	const named = e.files.map((f) => path.resolve(cl.top, f)).filter((f) => fs.existsSync(f)).map((f) => fs.realpathSync(f));
+	const starts = [...cl.editable(named).keys()];
 	if (!starts.length) return {
 		ok: false,
 		reason: "no source file for the element",
 		searched: 0
 	};
-	const files = reachable(cl.top, starts);
+	const files = [...cl.editable(reachable(cl.top, starts)).keys()];
 	const re = pattern(from);
 	const hits = [];
 	for (const file of files) {
@@ -1942,6 +1982,11 @@ function applyTextEdit(cl, e) {
 }
 /** Writes one file as the comment's change, through the same path as the session's edits. */
 function write(cl, e, file, searched, edit) {
+	if (!cl.editable([file]).size) return {
+		ok: false,
+		reason: "the text is in a file stift does not write",
+		searched
+	};
 	const agent = `bridge-${e.taskId}`;
 	cl.begin(e.taskId, agent, e.comment);
 	try {
@@ -13741,6 +13786,8 @@ var Bridge = class {
 	telemetry;
 	/** The session's transcript (from the Stop hook), for the $ai_generation event of each comment's turn. */
 	transcript;
+	/** The session id the owning session's hooks send now (it changes on /clear and resume): edits are recorded for it only. */
+	hookSession;
 	constructor(repoDir, opts = {}) {
 		this.cl = new Changes(repoDir);
 		this.opts = opts;
@@ -13912,6 +13959,7 @@ var Bridge = class {
 		if (body.protocol !== 4) return json({ stale: true });
 		if (!this.owns(body.session, body.pid)) return json(route === "/check" ? { text: "" } : { kind: "quiet" });
 		if (typeof body.transcript === "string") this.transcript = body.transcript;
+		if (typeof body.session === "string" && body.session) this.hookSession = body.session;
 		if (route === "/check") return json({ wake: this.check() });
 		const ac = new AbortController();
 		res.on("close", () => ac.abort());
@@ -14116,16 +14164,33 @@ var Bridge = class {
 		if (this.comments.has(payload.id)) return null;
 		payload.sessionId = this.sessionId;
 		const { screenshot, root, ...rest } = payload.target;
-		const rel = (f) => this.cl.relPath(path.resolve(root ?? this.cl.top, f)) ?? f;
-		const source = rest.source.map((s) => ({
-			...s,
-			file: rel(s.file)
-		}));
+		const rel = (f) => {
+			const r = typeof f === "string" && f.length < 1e3 ? this.cl.relPath(path.resolve(typeof root === "string" && root ? root : this.cl.top, f)) : null;
+			return r && !/[\x00-\x1f\x7f]/.test(r) ? r : null;
+		};
+		const int = (n) => Number.isInteger(n) && n > 0 && n < 1e7;
+		const source = (Array.isArray(rest.source) ? rest.source : []).flatMap((s) => {
+			const file = rel(s?.file);
+			if (!file || !int(s.line) || !["data-stift-src", "owner-stack"].includes(s.via) || ![
+				"definition",
+				"usage",
+				"element"
+			].includes(s.role)) return [];
+			return [{
+				file,
+				line: s.line,
+				...int(s.column) ? { column: s.column } : {},
+				confidence: Number(s.confidence) || 0,
+				via: s.via,
+				role: s.role
+			}];
+		});
+		const context = Array.isArray(rest.context) ? rest.context.flatMap((f) => rel(f) ?? []) : void 0;
 		const target = {
 			...rest,
 			root,
 			source,
-			context: rest.context?.map(rel),
+			context,
 			screenshot: null
 		};
 		payload.target = target;
@@ -14195,7 +14260,8 @@ var Bridge = class {
 	*/
 	async resolveSource(payload, origin) {
 		const t = payload.target;
-		const frames = t.frames ?? [];
+		if (!Array.isArray(t.source)) t.source = [];
+		const frames = (Array.isArray(t.frames) ? t.frames : []).filter((f) => typeof f?.stack === "string").slice(0, 8);
 		delete t.frames;
 		if (!frames.length) return;
 		const root = t.root ?? this.cl.top;
@@ -14545,7 +14611,7 @@ var Bridge = class {
 		if (c.next === "comment") this.onFeature(c);
 		c.phase = "working";
 		this.activeId = id;
-		this.cl.setActive(id);
+		this.cl.setActive(id, this.hookSession);
 		this.setStatus(c, c.next === "fix" ? "fixing" : "working", c.next === "fix" ? c.record.message : void 0);
 		this.reorder();
 		return {
@@ -14558,7 +14624,7 @@ var Bridge = class {
 	/** The ▶ line the session writes when it starts on the comment. */
 	startLine(c) {
 		const p = c.record.payload;
-		const file = p.target.source[0]?.file ?? p.target.context?.[0] ?? p.target.selector;
+		const file = p.target.source[0]?.file ?? p.target.context?.[0] ?? short(String(p.target.selector), 80);
 		if (c.next === "fix") return `▶ stift #${c.n} fix "${short(c.errors[0] ?? "errors after the update")}" · ${(c.record.files ?? [file])[0]}`;
 		const what = p.kind === "exact-edit" ? `“${p.values?.from ?? ""}” → “${p.values?.to ?? ""}”` : p.text;
 		return `▶ stift #${c.n} "${short(what)}" · ${file}`;
