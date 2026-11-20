@@ -15,23 +15,34 @@ Check these first, and if one is missing, say which in one line, how to get it, 
 - **Claude Code:** `claude --version` (in the Claude Code desktop app, `claude` may not be on PATH: use `"$CLAUDE_CODE_EXECPATH"` in its place, here and below).
 - **A React app on Vite or Next.js:** a `vite.config.*` or `next.config.*` with `react` in its `package.json`, at the root or in a subfolder. stift supports nothing else for now.
 
-## 1. Install the plugin, if its tools are missing
+## 1. Install or update the plugin
 
-Look for the stift tools first (`mcp__plugin_stift_bridge__start_listening`; you may need a tool search for "stift"). If you have them, skip to step 2.
+Claude Code doesn't update plugins from third-party marketplaces by itself, so do it here every time. See where `stift` comes from with `claude plugin marketplace list`, and which version is installed with `claude plugin list --json` (the `version` of `stift@stift`):
 
-Otherwise install the plugin from its public GitHub marketplace:
+- **From `taste-agency/stift-plugin`:** update it, even when you already have the stift tools (`mcp__plugin_stift_bridge__start_listening`):
 
-```sh
-claude plugin marketplace add taste-agency/stift-plugin
-claude plugin install stift@stift
-claude plugin list
-```
+  ```sh
+  claude plugin marketplace update stift
+  claude plugin update stift@stift
+  ```
 
-If the `stift` marketplace is already registered from `taste-agency/stift-plugin`, run `claude plugin marketplace update stift` and then `claude plugin update stift@stift` instead. Check that `stift@stift` shows as enabled. If `claude plugin marketplace list` shows `stift` coming from another GitHub repository (such as `taste-agency/stift`), replace it: `claude plugin uninstall stift@stift`, `claude plugin marketplace remove stift`, then the commands above. If it comes from a local directory, it's a development install: leave it as it is, and use that directory as `STIFT`. If installing fails or keeps hitting permission or sandbox errors, say in one line what failed and carry on with step 2 if `STIFT` exists: setup works without the plugin, and the person can install it later.
+  Compare the version before and after. If it changed, this conversation still runs the old version: tell the person (in step 3) that stift was updated and that they run `/reload-plugins` (or restart Claude Code) to load it, but don't stop here. Continue with the command-line steps in step 2, which use the updated files under `STIFT`, and treat `/stift:setup` and `/stift:start` as not available in this conversation.
+- **From another GitHub repository** (such as `taste-agency/stift`): replace it with `claude plugin uninstall stift@stift` and `claude plugin marketplace remove stift`, then install it as below.
+- **From a local directory:** it's a development install. Leave it as it is, and use that directory as `STIFT`.
+- **Not there:** install it from its public GitHub marketplace:
+
+  ```sh
+  claude plugin marketplace add taste-agency/stift-plugin
+  claude plugin install stift@stift
+  ```
+
+Check with `claude plugin list` that `stift@stift` shows as enabled. Then turn on auto-update for the `stift` marketplace, so later versions arrive by themselves: in the Claude Code user settings (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` when that is set), add `"autoUpdate": true` next to `source` in `extraKnownMarketplaces.stift`, changing nothing else. Skip this for a development install.
+
+If installing or updating fails or keeps hitting permission or sandbox errors, say in one line what failed and carry on with step 2 if `STIFT` exists: setup works without the plugin, and the person can install it later.
 
 ## 2. Add the integration and check it
 
-If `/stift:setup` is available in this conversation, follow it. A plugin installed in step 1 usually loads only in the next conversation, so otherwise do the same from the command line:
+If `/stift:setup` is available in this conversation, follow it. A plugin installed or updated in step 1 loads only in the next conversation or after `/reload-plugins`, so otherwise do the same from the command line:
 
 1. From the project root, run `node STIFT/packages/claude-plugin/dist/stift.mjs setup` (add `--dir <app>` in a monorepo when it asks). It detects Vite or Next.js, copies a dev-only adapter into `<app>/stift/`, wraps the Vite or Next.js config, and allows the stift tools in `.claude/settings.local.json`.
    - Exit 0: done. Exit 2: make the `TODO` edits it prints yourself, keeping them dev only.
@@ -52,4 +63,4 @@ In a few lines, with the app's URL:
 
 ## 4. Start listening
 
-Finish by listening for changes in this same conversation, so the person can start editing right away: if `/stift:start` is available here, follow it now (it arms listening and ends the turn; stift wakes the conversation with each change, and `/stift:stop` stops it). If it isn't, because the plugin was installed in step 1 and loads only in the next conversation, say instead that they need to run `/stift:start` in a new conversation in this project, and say it as the last line of your message.
+Finish by listening for changes in this same conversation, so the person can start editing right away: if `/stift:start` is available here, follow it now (it arms listening and ends the turn; stift wakes the conversation with each change, and `/stift:stop` stops it). If it isn't, because the plugin was installed or updated in step 1 and loads only in the next conversation, say instead that they need to run `/reload-plugins` and then `/stift:start` (or `/stift:start` in a new conversation in this project), and say it as the last line of your message.
