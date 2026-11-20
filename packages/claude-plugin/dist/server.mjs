@@ -13434,6 +13434,25 @@ function identity(dir) {
 		name
 	};
 }
+/**
+* Claude Code's version, from the AI_AGENT it sets for MCP servers, hooks and Bash (`claude-code_2-1-311_harness`), and how
+* the person signs in to Claude: Bedrock, Vertex, Foundry, an API key, or a subscription with its plan (oauthAccount's
+* organizationType in Claude Code's config, such as claude_max or claude_team). Never tokens, emails or org names.
+*/
+function claudeFacts(env = process.env) {
+	const on = (v) => /^(1|true)$/i.test(v ?? "");
+	const auth = on(env.CLAUDE_CODE_USE_BEDROCK) ? "bedrock" : on(env.CLAUDE_CODE_USE_VERTEX) ? "vertex" : on(env.CLAUDE_CODE_USE_FOUNDRY) ? "foundry" : env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN ? "api_key" : void 0;
+	let plan;
+	try {
+		if (!auth) plan = JSON.parse(fs.readFileSync(path.join(env.CLAUDE_CONFIG_DIR || os.homedir(), ".claude.json"), "utf8")).oauthAccount?.organizationType;
+	} catch {}
+	const claude_plan = typeof plan === "string" && /^\w{1,40}$/.test(plan) ? plan : void 0;
+	return {
+		claude_code_version: env.AI_AGENT?.match(/^claude-code_(\d+)-(\d+)-(\d+)/)?.slice(1).join("."),
+		claude_auth: auth ?? (claude_plan && "subscription"),
+		claude_plan
+	};
+}
 const SECRETS = [
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
 	/\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{16,}/g,
@@ -13441,7 +13460,7 @@ const SECRETS = [
 	/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
 	/\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{4,}/g,
 	/\b[A-Fa-f0-9]{40,}\b/g,
-	/\b(?=[A-Za-z0-9+/_-]*\d)(?=[A-Za-z0-9+/_-]*[a-z])(?=[A-Za-z0-9+/_-]*[A-Z])[A-Za-z0-9+/_-]{40,}={0,2}/g
+	/\b(?=[A-Za-z0-9+_-]*\d)(?=[A-Za-z0-9+_-]*[a-z])(?=[A-Za-z0-9+_-]*[A-Z])[A-Za-z0-9+_-]{40,}={0,2}/g
 ];
 const ASSIGNED = /((?:api[_-]?key|secret|token|passw(?:or)?d|pwd|credential|auth)[\w-]*["']?\s*[:=]\s*["'`]?)[^\s"'`,;)]{6,}/gi;
 const BEARER = /\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi;
@@ -13481,14 +13500,15 @@ var Telemetry = class {
 	dir;
 	constructor(dir, base = {}) {
 		this.dir = dir;
+		const key = projectKey();
 		this.base = {
 			stift_version: STIFT_VERSION,
 			os: process.platform,
 			arch: process.arch,
 			node: process.versions.node,
+			...key ? claudeFacts() : {},
 			...base
 		};
-		const key = projectKey();
 		if (!key) return;
 		try {
 			this.ph = new PostHog(key, {
@@ -13516,7 +13536,10 @@ var Telemetry = class {
 			properties: {
 				...who.email ? { email: who.email } : {},
 				...who.name ? { name: who.name } : {},
-				stift_version: STIFT_VERSION
+				...claudeFacts(),
+				stift_version: STIFT_VERSION,
+				os: process.platform,
+				arch: process.arch
 			}
 		});
 	}

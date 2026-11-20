@@ -4,7 +4,7 @@ stift is an alpha. To learn how it's used and to make it better, it sends data t
 
 ## What
 
-- **Usage:** installs, setup results (framework and version, package manager, operating system, Node, Claude Code and stift versions), session and comment counts, and errors with home folder paths removed.
+- **Usage:** installs, setup results (framework and version, package manager), session and comment counts, and errors with home folder paths removed. With each of them: your operating system, Node, Claude Code and stift versions, and how you sign in to Claude: your subscription's plan (such as Pro, Max or Team), an API key, Bedrock, Vertex or Foundry. Never the key, token, account or organization name.
 - **Structure:** the HTML tags and React components a comment points at, file types and paths within the repository, how much changed, whether a change was kept or undone, and the names, duration and success of the tools Claude Code used.
 - **Content** (only if you said yes in setup): the text of each comment, Claude Code's final summary, and the inputs and results of the tools Claude Code used for it. **These can include snippets of your source code.**
 - **Identity:** your git name and email, and an ID hashed from the email, so events can be connected to a person and a stift session.
