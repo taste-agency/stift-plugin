@@ -41,6 +41,7 @@ const forOtherProcess = () => {
 /** The file the ConfigChange hook of `stift start` writes in .git/stift once Claude Code applied its hooks (claude/start.ts). */
 const readyFile = (stiftDir, pid) => path.join(stiftDir, `hooks-ready-${pid}`);
 const RELEASED = "stift: another Claude Code session started listening for comments in this repository and took over the browser overlay. Tell the user in one line that this session no longer listens.";
+const REMOVED = "stift: stift was removed from this project (stift remove), so this session no longer listens for comments from the browser. Tell the user that in one line.";
 /**
 * What the session reads when stift wakes it (the Stop hook), or with the user's prompt (`withPrompt`, the
 * UserPromptSubmit hook).
@@ -183,6 +184,7 @@ if (mode === "wait") {
 		if (!r || r.kind === "quiet") process.exit(0);
 		if (r.kind === "wake") wake(wakeText(r.wake));
 		if (r.kind === "released") wake(RELEASED);
+		if (r.kind === "removed") wake(REMOVED);
 		first = false;
 	}
 }

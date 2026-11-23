@@ -59,6 +59,7 @@ In a few lines, with the app's URL:
 - The bar's change count opens the list of changes; click one to jump to it.
 - Each comment becomes a commit on their feature branch (a comment on the base branch starts one, named after it). Cmd+Z on the page or "undo the last change" in the session undoes the newest. Their own uncommitted edits stay uncommitted. The shelf on stift's bar lists their features; Review pushes the branch and opens or updates its pull request.
 - What changed in the project (`git status --short`): the `.stift/` folder and the config line are dev only; production builds don't include them. The integration stays local to their machine: `.stift/` is excluded in `.git/info/exclude`, the config edit stays an uncommitted change that rides along across branch switches, and stift never puts either into a comment commit, a Review push or a pull request.
+- To take stift out of the project again, they run `/stift:remove`: it undoes the config edit and removes `.stift/` and stift's local settings and state, and leaves their commits, branches and edits.
 
 ## 4. Start listening
 

@@ -228,7 +228,7 @@ function trailers(message) {
 	for (const m of message.matchAll(/^([A-Za-z-]+): (.+)$/gm)) out.set(m[1], m[2].trim());
 	return out;
 }
-var Changes = class {
+var Changes = class Changes {
 	top;
 	gitDir;
 	dir;
@@ -253,6 +253,11 @@ var Changes = class {
 			if ((fs.statSync(this.dir).mode & 63) !== 0) fs.chmodSync(this.dir, 448);
 		} catch {}
 		for (const sub of ["tasks", "comments"]) fs.mkdirSync(path.join(this.dir, sub), { recursive: true });
+	}
+	/** The repository's stift state, or null when it has none (stift never listened there, or was removed): creates nothing. */
+	static existing(cwd) {
+		const gitDir = git$3(["rev-parse", "--absolute-git-dir"], { cwd }).out.trim();
+		return fs.existsSync(path.join(gitDir, "stift")) ? new Changes(cwd) : null;
 	}
 	/** Repository-relative POSIX path, or null outside the working tree or inside .git. */
 	relPath(file) {
@@ -1043,10 +1048,14 @@ function save(dir, c) {
 	fs.writeFileSync(`${f}.tmp`, JSON.stringify(c));
 	fs.renameSync(`${f}.tmp`, f);
 }
-/** Deletes a comment's inbox file and its screenshot. */
+/** Deletes a comment's inbox file, its screenshot and its attachments. */
 function forget(dir, c) {
 	fs.rmSync(file$2(dir, c.record.payload.id), { force: true });
 	if (c.shot) fs.rmSync(c.shot, { force: true });
+	if (c.attached?.length) fs.rmSync(path.dirname(c.attached[0]), {
+		recursive: true,
+		force: true
+	});
 }
 /** Which comments a new bridge keeps: everything not settled, and what settled today (local time). */
 function keep(c, now = /* @__PURE__ */ new Date()) {
@@ -1069,6 +1078,39 @@ function load(dir, now = /* @__PURE__ */ new Date()) {
 	} catch {}
 	return out.sort((a, b) => a.queuedAt - b.queuedAt);
 }
+// packages/claude-plugin/src/attachments.ts
+const EXT = {
+	"image/png": "png",
+	"image/jpeg": "jpg",
+	"image/gif": "gif",
+	"image/webp": "webp",
+	"application/pdf": "pdf",
+	"text/plain": "txt"
+};
+/**
+* Saves a comment's attachments in `dir` and returns their paths, in order. Entries that aren't a data URL of a known
+* type are skipped. File names keep a cleaned-up part of the original name, for the session to tell them apart.
+*/
+function saveAttachments(dir, list) {
+	if (!Array.isArray(list)) return [];
+	const out = [];
+	let total = 0;
+	for (const a of list.slice(0, 10)) {
+		const m = typeof a?.data === "string" ? /^data:([\w/+.-]+);base64,([A-Za-z0-9+/]*={0,2})$/.exec(a.data) : null;
+		const ext = m && Object.hasOwn(EXT, m[1]) ? EXT[m[1]] : null;
+		if (!m || !ext) continue;
+		const bytes = Buffer.from(m[2], "base64");
+		if ((total += bytes.length) > 20971520) break;
+		const base = (typeof a.name === "string" ? a.name : "").replace(/[^\w.-]+/g, "_").replace(/^[._]+/, "").slice(0, 60) || "file";
+		const file = path.join(dir, `${out.length + 1}-${base.replace(new RegExp(`\\.${ext}$`, "i"), "")}.${ext}`);
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(file, bytes);
+		out.push(file);
+	}
+	return out;
+}
+/** The brief's line for them: the session Reads each file itself. */
+const attachedLine = (files) => files.length ? `\nThe user attached ${files.length === 1 ? "a file" : `${files.length} files`} to the comment; Read ${files.length === 1 ? "it" : "them"}: ${files.join(", ")}` : "";
 // packages/claude-plugin/src/frames.ts
 /** React's own frames at the top of an owner stack: where JSX was created, not by whom. */
 const INTERNAL = /^(fakeJSXCallSite|(exports\.|Object\.)?(jsx|jsxs|jsxDEV|createElement|react_stack_bottom_frame))$/;
@@ -14415,12 +14457,12 @@ var Bridge = class {
 			if (JSON.parse(fs.readFileSync(f, "utf8")).pid === process.pid) fs.rmSync(f);
 		} catch {}
 	}
-	/** Another session started listening in this repository: hand it the port. */
-	async release() {
+	/** Another session started listening in this repository: hand it the port. `removed`: stift remove ran instead. */
+	async release(removed = false) {
 		this.opts.onRelease?.();
 		this.armed = false;
 		this.listening = false;
-		this.answer("released");
+		this.answer(removed ? "removed" : "released");
 		await this.stop();
 	}
 	request(req, res) {
@@ -14470,7 +14512,7 @@ var Bridge = class {
 		}
 		if (req.method === "POST" && url.pathname === "/release" && sameToken(req.headers["x-stift-release"], this.token)) {
 			res.writeHead(200).end("released\n");
-			this.release();
+			this.release(url.searchParams.has("removed"));
 			return;
 		}
 		if (req.method === "POST" && (url.pathname === "/wait" || url.pathname === "/check") && sameToken(req.headers["x-stift-token"], this.token)) {
@@ -14805,6 +14847,8 @@ var Bridge = class {
 			fs.mkdirSync(path.dirname(shot), { recursive: true });
 			fs.writeFileSync(shot, Buffer.from(screenshot.slice(22), "base64"));
 		}
+		const attached = saveAttachments(path.join(this.cl.dir, "attachments", payload.id.replace(/[^\w-]/g, "_")), payload.attachments);
+		delete payload.attachments;
 		const c = {
 			record: {
 				payload,
@@ -14818,7 +14862,8 @@ var Bridge = class {
 			phase: "queued",
 			errors: [],
 			queuedAt: Date.now(),
-			shot
+			shot,
+			attached
 		};
 		this.number(c);
 		this.comments.set(payload.id, c);
@@ -15315,8 +15360,8 @@ var Bridge = class {
 		const c = this.comments.get(id);
 		if (!c) throw new Error(`No comment ${id}.`);
 		const p = c.record.payload;
-		if (c.next === "fix") return fixPrompt(p, c.record.files ?? [], c.errors);
-		const brief = p.kind === "exact-edit" ? exactEditPrompt(p) : commentPrompt(p);
+		if (c.next === "fix") return fixPrompt(p, c.record.files ?? [], c.errors, c.attached ?? []);
+		const brief = p.kind === "exact-edit" ? exactEditPrompt(p) : commentPrompt(p, c.attached ?? []);
 		return c.failedBefore ? `${brief}\n\nAn earlier attempt at this failed, and the user asked you to try again: ${pageData(c.failedBefore)}\nAddress that this time.` : brief;
 	}
 	/**
@@ -15817,15 +15862,15 @@ function where(target, extra = []) {
 }
 /** What stift needs from the session besides the change: edits it can record, and a way to say it couldn't. */
 const RULES = (id) => `Edit files with the Edit or Write tools (stift records those) and don't run git. If it can't be done in this repository's code, call report_comment with id ${JSON.stringify(id)}, status "failed" and a short reason.`;
-function commentPrompt(p) {
+function commentPrompt(p, attached) {
 	return `Comment on the running app: ${JSON.stringify(p.text)}
-Where: ${where(p.target)}
+Where: ${where(p.target)}${attachedLine(attached)}
 
 ${RULES(p.id)}`;
 }
-function fixPrompt(p, files, errors) {
+function fixPrompt(p, files, errors, attached) {
 	return `The change for the comment ${JSON.stringify(p.text)} (in ${files.join(", ")}) broke the page. Fix these errors, keeping what the comment asked for:
-${pageData(errors.map((e) => `- ${e}`).join("\n"))}
+${pageData(errors.map((e) => `- ${e}`).join("\n"))}${attachedLine(attached)}
 
 ${RULES(p.id)}`;
 }

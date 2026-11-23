@@ -229,7 +229,7 @@ function trailers(message) {
 	for (const m of message.matchAll(/^([A-Za-z-]+): (.+)$/gm)) out.set(m[1], m[2].trim());
 	return out;
 }
-var Changes = class {
+var Changes = class Changes {
 	top;
 	gitDir;
 	dir;
@@ -254,6 +254,11 @@ var Changes = class {
 			if ((fs.statSync(this.dir).mode & 63) !== 0) fs.chmodSync(this.dir, 448);
 		} catch {}
 		for (const sub of ["tasks", "comments"]) fs.mkdirSync(path.join(this.dir, sub), { recursive: true });
+	}
+	/** The repository's stift state, or null when it has none (stift never listened there, or was removed): creates nothing. */
+	static existing(cwd) {
+		const gitDir = git$3(["rev-parse", "--absolute-git-dir"], { cwd }).out.trim();
+		return fs.existsSync(path.join(gitDir, "stift")) ? new Changes(cwd) : null;
 	}
 	/** Repository-relative POSIX path, or null outside the working tree or inside .git. */
 	relPath(file) {
@@ -2226,10 +2231,14 @@ function save(dir, c) {
 	fs.writeFileSync(`${f}.tmp`, JSON.stringify(c));
 	fs.renameSync(`${f}.tmp`, f);
 }
-/** Deletes a comment's inbox file and its screenshot. */
+/** Deletes a comment's inbox file, its screenshot and its attachments. */
 function forget(dir, c) {
 	fs.rmSync(file$1(dir, c.record.payload.id), { force: true });
 	if (c.shot) fs.rmSync(c.shot, { force: true });
+	if (c.attached?.length) fs.rmSync(path.dirname(c.attached[0]), {
+		recursive: true,
+		force: true
+	});
 }
 /** Which comments a new bridge keeps: everything not settled, and what settled today (local time). */
 function keep(c, now = /* @__PURE__ */ new Date()) {
@@ -2252,6 +2261,39 @@ function load(dir, now = /* @__PURE__ */ new Date()) {
 	} catch {}
 	return out.sort((a, b) => a.queuedAt - b.queuedAt);
 }
+// packages/claude-plugin/src/attachments.ts
+const EXT = {
+	"image/png": "png",
+	"image/jpeg": "jpg",
+	"image/gif": "gif",
+	"image/webp": "webp",
+	"application/pdf": "pdf",
+	"text/plain": "txt"
+};
+/**
+* Saves a comment's attachments in `dir` and returns their paths, in order. Entries that aren't a data URL of a known
+* type are skipped. File names keep a cleaned-up part of the original name, for the session to tell them apart.
+*/
+function saveAttachments(dir, list) {
+	if (!Array.isArray(list)) return [];
+	const out = [];
+	let total = 0;
+	for (const a of list.slice(0, 10)) {
+		const m = typeof a?.data === "string" ? /^data:([\w/+.-]+);base64,([A-Za-z0-9+/]*={0,2})$/.exec(a.data) : null;
+		const ext = m && Object.hasOwn(EXT, m[1]) ? EXT[m[1]] : null;
+		if (!m || !ext) continue;
+		const bytes = Buffer.from(m[2], "base64");
+		if ((total += bytes.length) > 20971520) break;
+		const base = (typeof a.name === "string" ? a.name : "").replace(/[^\w.-]+/g, "_").replace(/^[._]+/, "").slice(0, 60) || "file";
+		const file = path.join(dir, `${out.length + 1}-${base.replace(new RegExp(`\\.${ext}$`, "i"), "")}.${ext}`);
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(file, bytes);
+		out.push(file);
+	}
+	return out;
+}
+/** The brief's line for them: the session Reads each file itself. */
+const attachedLine = (files) => files.length ? `\nThe user attached ${files.length === 1 ? "a file" : `${files.length} files`} to the comment; Read ${files.length === 1 ? "it" : "them"}: ${files.join(", ")}` : "";
 // packages/claude-plugin/src/frames.ts
 /** React's own frames at the top of an owner stack: where JSX was created, not by whom. */
 const INTERNAL = /^(fakeJSXCallSite|(exports\.|Object\.)?(jsx|jsxs|jsxDEV|createElement|react_stack_bottom_frame))$/;
@@ -14649,12 +14691,12 @@ var Bridge = class {
 			if (JSON.parse(fs.readFileSync(f, "utf8")).pid === process.pid) fs.rmSync(f);
 		} catch {}
 	}
-	/** Another session started listening in this repository: hand it the port. */
-	async release() {
+	/** Another session started listening in this repository: hand it the port. `removed`: stift remove ran instead. */
+	async release(removed = false) {
 		this.opts.onRelease?.();
 		this.armed = false;
 		this.listening = false;
-		this.answer("released");
+		this.answer(removed ? "removed" : "released");
 		await this.stop();
 	}
 	request(req, res) {
@@ -14704,7 +14746,7 @@ var Bridge = class {
 		}
 		if (req.method === "POST" && url.pathname === "/release" && sameToken(req.headers["x-stift-release"], this.token)) {
 			res.writeHead(200).end("released\n");
-			this.release();
+			this.release(url.searchParams.has("removed"));
 			return;
 		}
 		if (req.method === "POST" && (url.pathname === "/wait" || url.pathname === "/check") && sameToken(req.headers["x-stift-token"], this.token)) {
@@ -15039,6 +15081,8 @@ var Bridge = class {
 			fs.mkdirSync(path.dirname(shot), { recursive: true });
 			fs.writeFileSync(shot, Buffer.from(screenshot.slice(22), "base64"));
 		}
+		const attached = saveAttachments(path.join(this.cl.dir, "attachments", payload.id.replace(/[^\w-]/g, "_")), payload.attachments);
+		delete payload.attachments;
 		const c = {
 			record: {
 				payload,
@@ -15052,7 +15096,8 @@ var Bridge = class {
 			phase: "queued",
 			errors: [],
 			queuedAt: Date.now(),
-			shot
+			shot,
+			attached
 		};
 		this.number(c);
 		this.comments.set(payload.id, c);
@@ -15549,8 +15594,8 @@ var Bridge = class {
 		const c = this.comments.get(id);
 		if (!c) throw new Error(`No comment ${id}.`);
 		const p = c.record.payload;
-		if (c.next === "fix") return fixPrompt(p, c.record.files ?? [], c.errors);
-		const brief = p.kind === "exact-edit" ? exactEditPrompt(p) : commentPrompt(p);
+		if (c.next === "fix") return fixPrompt(p, c.record.files ?? [], c.errors, c.attached ?? []);
+		const brief = p.kind === "exact-edit" ? exactEditPrompt(p) : commentPrompt(p, c.attached ?? []);
 		return c.failedBefore ? `${brief}\n\nAn earlier attempt at this failed, and the user asked you to try again: ${pageData(c.failedBefore)}\nAddress that this time.` : brief;
 	}
 	/**
@@ -16051,15 +16096,15 @@ function where(target, extra = []) {
 }
 /** What stift needs from the session besides the change: edits it can record, and a way to say it couldn't. */
 const RULES = (id) => `Edit files with the Edit or Write tools (stift records those) and don't run git. If it can't be done in this repository's code, call report_comment with id ${JSON.stringify(id)}, status "failed" and a short reason.`;
-function commentPrompt(p) {
+function commentPrompt(p, attached) {
 	return `Comment on the running app: ${JSON.stringify(p.text)}
-Where: ${where(p.target)}
+Where: ${where(p.target)}${attachedLine(attached)}
 
 ${RULES(p.id)}`;
 }
-function fixPrompt(p, files, errors) {
+function fixPrompt(p, files, errors, attached) {
 	return `The change for the comment ${JSON.stringify(p.text)} (in ${files.join(", ")}) broke the page. Fix these errors, keeping what the comment asked for:
-${pageData(errors.map((e) => `- ${e}`).join("\n"))}
+${pageData(errors.map((e) => `- ${e}`).join("\n"))}${attachedLine(attached)}
 
 ${RULES(p.id)}`;
 }
@@ -16116,6 +16161,19 @@ const CONFIGS = {
 };
 /** The Vite or Next.js app in `dir`, or in one directory below it (monorepos: apps/web, web, …). */
 function detect(dir) {
+	const found = apps(dir);
+	if (found.length === 1) return found[0];
+	if (found.length > 1) return {
+		name: null,
+		reason: `Several apps found: ${found.map((f) => path.relative(dir, f.app)).join(", ")}. Run setup again with --dir <app>.`
+	};
+	return {
+		name: null,
+		reason: "No Vite or Next.js app found (no package.json with a vite or next dependency). stift supports React apps on Vite or Next.js for now."
+	};
+}
+/** The Vite or Next.js app in `dir`, else every one in the directories below it (and below apps/ and packages/). */
+function apps(dir) {
 	const look = (app) => {
 		let pkg;
 		try {
@@ -16136,7 +16194,7 @@ function detect(dir) {
 		};
 	};
 	const found = look(dir);
-	if (found) return found;
+	if (found) return [found];
 	const below = [];
 	for (const parent of [
 		dir,
@@ -16153,15 +16211,7 @@ function detect(dir) {
 			if (f) below.push(f);
 		}
 	}
-	if (below.length === 1) return below[0];
-	if (below.length > 1) return {
-		name: null,
-		reason: `Several apps found: ${below.map((f) => path.relative(dir, f.app)).join(", ")}. Run setup again with --dir <app>.`
-	};
-	return {
-		name: null,
-		reason: "No Vite or Next.js app found (no package.json with a vite or next dependency). stift supports React apps on Vite or Next.js for now."
-	};
+	return below;
 }
 const NEXT_DTS = `// Types for stift-next.cjs (stift, dev only).\ndeclare const stift: { withStift<T>(config: T, options?: { allowOrigins?: string[] }): any }\nexport = stift\n`;
 const VITE_DTS = `// Types for vite.mjs (stift, dev only).\nimport type { Plugin } from 'vite'\nexport default function stift(options?: { allowOrigins?: string[] }): Plugin\n`;
@@ -16338,8 +16388,8 @@ function tracked(dir, file) {
 		return false;
 	}
 }
-/** Takes the folder's line, as excludeLocally wrote it, back out of .git/info/exclude. */
-function unexcludeLocally(dir, folder) {
+/** Takes the line excludeLocally wrote for a file or folder (which may be gone) back out of .git/info/exclude. Returns whether it was there. */
+function unexcludeLocally(dir, file, folder = true) {
 	try {
 		const exclude = execFileSync("git", [
 			"rev-parse",
@@ -16348,13 +16398,21 @@ function unexcludeLocally(dir, folder) {
 			"info/exclude"
 		], {
 			cwd: dir,
-			encoding: "utf8"
+			encoding: "utf8",
+			stdio: [
+				"ignore",
+				"pipe",
+				"ignore"
+			]
 		}).trim();
-		const line = `/${path.relative(fs.realpathSync(gitTop(dir)), path.join(fs.realpathSync(path.dirname(folder)), path.basename(folder)))}/`;
+		const line = `/${path.relative(fs.realpathSync(gitTop(dir)), path.join(fs.realpathSync(dir), path.relative(dir, file)))}${folder ? "/" : ""}`;
 		const had = fs.readFileSync(exclude, "utf8");
 		const kept = had.split("\n").filter((l) => l !== line).join("\n");
 		if (kept !== had) fs.writeFileSync(exclude, kept);
-	} catch {}
+		return kept !== had;
+	} catch {
+		return false;
+	}
 }
 /**
 * The quotes and semicolons a file uses, from its imports and requires (else its statements): what most of them do.
@@ -16890,6 +16948,8 @@ const hookPid = (h) => {
 };
 /** Git for Fix in Claude, as /stift:start allows it (commands/start.md); its brief says not to discard the user's work. */
 const GIT_RULE = "Bash(git:*)";
+/** The file in .git/stift that says stift added GIT_RULE (the user's own stays). */
+const GIT_RULE_MARK = "git-rule-added";
 const isToolRule = (r) => typeof r === "string" && /^Bash\(node '.*\/stift\.mjs' tool \*\)$/.test(r);
 function alive(pid) {
 	try {
@@ -16930,8 +16990,8 @@ function setSessionHooks(dir, dist, pid, on, ready) {
 	const rule = `Bash(${cli(dist)} tool *)`;
 	const kept = (settings.permissions?.allow ?? []).filter((r) => !isToolRule(r) || left && r === rule);
 	if (left && !kept.includes(rule)) kept.push(rule);
-	const gitOwned = path.join(new Changes(dir).dir, "git-rule-added");
-	if (left && !kept.includes(GIT_RULE)) {
+	const gitOwned = path.join(new Changes(dir).dir, GIT_RULE_MARK);
+	if (left && !kept.includes("Bash(git:*)")) {
 		kept.push(GIT_RULE);
 		fs.mkdirSync(path.dirname(gitOwned), { recursive: true });
 		fs.writeFileSync(gitOwned, "");
@@ -17018,7 +17078,10 @@ async function start(dir, dist) {
 /** `stift bridge` (started by `stift start`): the bridge for the Claude Code process CLAUDE_PID, until it ends. */
 async function runBridge(dir, dist) {
 	const pid = Number(process.env.CLAUDE_PID);
+	let unhooked = false;
 	const unhook = () => {
+		if (unhooked) return;
+		unhooked = true;
 		try {
 			setSessionHooks(dir, dist, pid, false);
 		} catch (e) {
@@ -17089,6 +17152,234 @@ async function tool(dir, name, json = "{}") {
 	else console.log(a.text);
 	return a.error ? 1 : 0;
 }
+// packages/claude-plugin/src/remove.ts
+/** The files setup puts in the adapter folder. */
+const ADAPTER_FILES = /* @__PURE__ */ new Set([
+	"next.cjs",
+	"next.d.cts",
+	"vite.mjs",
+	"vite.d.mts"
+]);
+/** The import of stift's adapter, as setup writes it (`./stift/` from setups before .stift/). */
+const SPEC = /(['"])\.\/\.?stift\/(?:vite\.mjs|next\.cjs)\1/;
+const IMPORT = /^[ \t]*import\s+stift\s+from\s+(['"])\.\/\.?stift\/(?:vite\.mjs|next\.cjs)\1;?[ \t]*(?:\r?\n|$)/gm;
+async function remove(dir) {
+	const done = [];
+	const left = [];
+	const rel = (p) => path.relative(dir, p) || ".";
+	let gitDir = null;
+	try {
+		gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
+			cwd: dir,
+			encoding: "utf8",
+			stdio: [
+				"ignore",
+				"pipe",
+				"ignore"
+			]
+		}).trim();
+	} catch {}
+	const top = gitDir ? gitTop(dir) : dir;
+	if (gitDir) {
+		const stopped = await stopBridge(gitDir);
+		if (stopped === true) done.push("Stopped the stift bridge in this repository; no session listens for comments from the browser anymore.");
+		else if (stopped === false) left.push(`The stift bridge in this repository (process ${readBridge(gitDir)?.pid}) didn't stop: run /stift:stop in the session that listens, or close it.`);
+	}
+	const gitRuleAdded = !!gitDir && fs.existsSync(path.join(gitDir, "stift", "git-rule-added"));
+	for (const d of /* @__PURE__ */ new Set([
+		dir,
+		top,
+		...apps(dir).map((f) => f.app)
+	])) cleanSettings(dir, path.join(d, ".claude", "settings.local.json"), gitRuleAdded, rel, done, left);
+	for (const f of apps(dir)) {
+		const configOk = !f.config || unwrap(dir, f, rel, done, left);
+		for (const name of [".stift", "stift"]) {
+			const folder = path.join(f.app, name);
+			if (fs.existsSync(folder)) removeFolder(dir, folder, configOk, rel, done, left);
+			if (!fs.existsSync(folder) && unexcludeLocally(dir, folder)) done.push(`Took ${rel(folder)}/ out of .git/info/exclude.`);
+		}
+	}
+	if (gitDir && fs.existsSync(path.join(gitDir, "stift"))) {
+		fs.rmSync(path.join(gitDir, "stift"), {
+			recursive: true,
+			force: true
+		});
+		done.push("Deleted stift's state in .git/stift (feature workflow, dev workflow, features list, comments, undo history). Your branches, commits and stashes stay.");
+	}
+	return {
+		done,
+		left
+	};
+}
+/**
+* Asks the bridge serving this repository (in a session's MCP server, or `stift bridge` from `stift start`) to let go,
+* with the token from bridge.json, and waits until it removed its bridge.json. Null when none runs.
+*/
+async function stopBridge(gitDir) {
+	const b = readBridge(gitDir);
+	if (!b) return null;
+	if (!await fetch(`${b.url}/release?removed`, {
+		method: "POST",
+		headers: { "x-stift-release": b.token },
+		signal: AbortSignal.timeout(3e3)
+	}).then((r) => r.ok).catch(() => false)) return null;
+	for (let i = 0; i < 50 && fs.existsSync(bridgeFile(gitDir)); i++) await new Promise((r) => setTimeout(r, 100));
+	return !fs.existsSync(bridgeFile(gitDir));
+}
+/**
+* Takes stift's entries out of a settings.local.json: setup's allow rule for the bridge's tools, and `stift start`'s
+* hooks with its `stift tool` rule and the git rule (only when stift added it). The file goes when nothing else is left.
+*/
+function cleanSettings(dir, file, gitRuleAdded, rel, done, left) {
+	if (!fs.existsSync(file)) return;
+	let settings;
+	try {
+		settings = JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch {
+		if (fs.readFileSync(file, "utf8").includes("stift")) left.push(`${rel(file)} isn't valid JSON: remove the stift entries (${TOOLS_RULE}, and hooks running stift's hook.mjs or listen.mjs) by hand.`);
+		return;
+	}
+	if (!settings || typeof settings !== "object") return;
+	const removed = [];
+	const allow = settings.permissions?.allow;
+	if (Array.isArray(allow)) {
+		const kept = allow.filter((r) => !(r === "mcp__plugin_stift_bridge" || isToolRule(r) || gitRuleAdded && r === "Bash(git:*)"));
+		if (kept.length !== allow.length) {
+			removed.push(...allow.filter((r) => !kept.includes(r)));
+			if (kept.length) settings.permissions.allow = kept;
+			else delete settings.permissions.allow;
+			if (!Object.keys(settings.permissions).length) delete settings.permissions;
+		}
+	}
+	const hooks = settings.hooks;
+	if (hooks && typeof hooks === "object") {
+		let n = 0;
+		for (const event of Object.keys(hooks)) {
+			if (!Array.isArray(hooks[event])) continue;
+			hooks[event] = hooks[event].map((g) => Array.isArray(g?.hooks) ? {
+				...g,
+				hooks: g.hooks.filter((h) => hookPid(h) === null ? true : (n++, false))
+			} : g).filter((g) => !Array.isArray(g?.hooks) || g.hooks.length);
+			if (!hooks[event].length) delete hooks[event];
+		}
+		if (n) removed.push(`${n} hook${n > 1 ? "s" : ""} of stift start`);
+		if (!Object.keys(hooks).length) delete settings.hooks;
+	}
+	if (!removed.length) return;
+	if (Object.keys(settings).length) {
+		fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n");
+		done.push(`Took stift's entries out of ${rel(file)} (${removed.join(", ")}); your own settings stay.`);
+		return;
+	}
+	unexcludeLocally(dir, file, false);
+	fs.rmSync(file);
+	try {
+		fs.rmdirSync(path.dirname(file));
+	} catch {}
+	done.push(`Deleted ${rel(file)}, which held only stift's entries (${removed.join(", ")}).`);
+}
+/**
+* Takes setup's edit back out of the Vite or Next.js config: the import of the adapter, and `stift()` in plugins or the
+* `withStift(…)` around the exported config. Only when each is there once, as setup wrote it; otherwise it leaves the
+* file and says what to remove. Returns whether the config no longer uses the adapter.
+*/
+function unwrap(dir, f, rel, done, left) {
+	const file = f.config;
+	const src = fs.readFileSync(file, "utf8");
+	if (!SPEC.test(src)) return true;
+	if (tracked(dir, file)) try {
+		const head = execFileSync("git", ["show", `HEAD:./${path.basename(file)}`], {
+			cwd: path.dirname(file),
+			encoding: "utf8",
+			stdio: [
+				"ignore",
+				"pipe",
+				"ignore"
+			]
+		});
+		if (SPEC.test(head)) {
+			left.push(`${rel(file)} uses stift in the last commit (the integration was committed): remove the stift import and ${f.name === "next" ? "the withStift(…) wrapper" : "stift() in plugins"} in a commit of your own.`);
+			return false;
+		}
+	} catch {}
+	const out = f.name === "next" ? unwrapNext(src) : unwrapVite(src);
+	if (out === null || SPEC.test(out) || /\bwithStift\b|\bstift\(/.test(out)) {
+		left.push(f.name === "next" ? `${rel(file)} was changed around stift's wrapper, so it was left as it is: remove the line importing ./.stift/next.cjs and replace stift.withStift(<config>) with <config> (or require('./.stift/next.cjs').withStift(<config>) with <config>). Then delete ${rel(path.join(f.app, ".stift"))}/.` : `${rel(file)} was changed around stift's plugin, so it was left as it is: remove the line importing ./.stift/vite.mjs and stift() from plugins. Then delete ${rel(path.join(f.app, ".stift"))}/.`);
+		return false;
+	}
+	fs.writeFileSync(file, out);
+	done.push(`Took stift out of ${rel(file)} (${f.name === "next" ? "the import and the withStift wrapper" : "the import and stift() in plugins"}).`);
+	return true;
+}
+function unwrapVite(src) {
+	if ((src.match(IMPORT) ?? []).length !== 1 || (src.match(/\bstift\(\)/g) ?? []).length !== 1) return null;
+	const s = src.replace(IMPORT, "");
+	for (const re of [
+		/\bstift\(\),[ \t]*(?:\r?\n[ \t]*)?/,
+		/,\s*\bstift\(\)(?=\s*\])/,
+		/\bstift\(\)(?=\s*\])/
+	]) if (re.test(s)) return s.replace(re, "");
+	return null;
+}
+function unwrapNext(src) {
+	const calls = [...src.matchAll(/\bstift\.withStift\(|\brequire\((['"])\.\/\.?stift\/next\.cjs\1\)\.withStift\(/g)];
+	if (calls.length !== 1) return null;
+	const esm = calls[0][0].startsWith("stift.");
+	if ((src.match(IMPORT) ?? []).length !== (esm ? 1 : 0)) return null;
+	const start = calls[0].index;
+	const open = start + calls[0][0].length - 1;
+	const close = closing(src, open);
+	if (close < 0) return null;
+	const inner = src.slice(open + 1, close);
+	if (topLevelComma(inner)) return null;
+	const s = src.slice(0, start) + inner.trim() + src.slice(close + 1);
+	return esm ? s.replace(IMPORT, "") : s;
+}
+/** The index of the bracket that closes the one at `open`, skipping strings; -1 when there is none. */
+function closing(src, open) {
+	let depth = 0;
+	for (let i = open; i < src.length; i++) {
+		const c = src[i];
+		if (c === "\"" || c === "'" || c === "`") {
+			for (i++; i < src.length && src[i] !== c; i++) if (src[i] === "\\") i++;
+		} else if ("([{".includes(c)) depth++;
+		else if (")]}".includes(c) && --depth === 0) return i;
+	}
+	return -1;
+}
+function topLevelComma(s) {
+	let depth = 0;
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i];
+		if (c === "\"" || c === "'" || c === "`") {
+			for (i++; i < s.length && s[i] !== c; i++) if (s[i] === "\\") i++;
+		} else if ("([{".includes(c)) depth++;
+		else if (")]}".includes(c)) depth--;
+		else if (c === "," && depth === 0 && s.slice(i + 1).trim()) return true;
+	}
+	return false;
+}
+/** Deletes the adapter folder when it holds only setup's files and Git doesn't track it. `stift/` only when it is stift's. */
+function removeFolder(dir, folder, configOk, rel, done, left) {
+	const names = fs.readdirSync(folder);
+	const adapter = ["next.cjs", "vite.mjs"].some((n) => {
+		try {
+			return fs.readFileSync(path.join(folder, n), "utf8").includes(n === "next.cjs" ? "withStift" : "/@stift/overlay.js");
+		} catch {
+			return false;
+		}
+	});
+	if (path.basename(folder) === "stift" && !adapter) return;
+	if (tracked(dir, folder)) return void left.push(`${rel(folder)}/ is committed in the repository (the integration was committed): delete it in a commit of your own.`);
+	if (!configOk) return void left.push(`Kept ${rel(folder)}/ because the config still imports it: delete it once the config no longer does.`);
+	const others = names.filter((n) => !ADAPTER_FILES.has(n));
+	if (others.length) return void left.push(`Kept ${rel(folder)}/ because it holds files stift didn't put there (${others.join(", ")}): delete stift's ${names.filter((n) => ADAPTER_FILES.has(n)).join(", ")} by hand, or the folder if those files aren't needed.`);
+	fs.rmSync(folder, {
+		recursive: true,
+		force: true
+	});
+	done.push(`Deleted ${rel(folder)}/ (the dev-only adapter).`);
+}
 // packages/claude-plugin/src/cli.ts
 /** The plugin's dist/, from this file in src/ or bundled as dist/stift.mjs. */
 const DIST = fileURLToPath(new URL("../dist/", import.meta.url));
@@ -17155,6 +17446,23 @@ if (cmd === "setup" || cmd === "check") {
 		console.error(e.message);
 		t.error(e, cmd);
 		await exit(1);
+	}
+} else if (cmd === "remove") {
+	const { values: o } = parseArgs({
+		args: process.argv.slice(3),
+		options: { dir: { type: "string" } }
+	});
+	try {
+		const r = await remove(path.resolve(o.dir ?? process.cwd()));
+		for (const l of r.done) console.log(`✓ ${l}`);
+		for (const l of r.left) console.log(`LEFT ${l}`);
+		if (!r.done.length && !r.left.length) console.log("stift isn't set up in this project: nothing to remove.");
+		console.log("· Your commits, branches (the feature branches stift made too), pull requests and your own edits stay as they are.");
+		console.log("· The stift plugin stays installed in Claude Code, for other projects. To uninstall it: claude plugin uninstall stift@stift");
+		process.exit(r.left.length ? 2 : 0);
+	} catch (e) {
+		console.error(e.message);
+		process.exit(1);
 	}
 } else if (cmd === "telemetry") {
 	const { values: o } = parseArgs({
@@ -17313,6 +17621,7 @@ else if (cmd === "undo" || cmd === "redo") {
 	if (!cmd || cmd === "-h" || cmd === "--help") {
 		console.log(`stift setup [--dir <app>]                Add the dev-only integration to a Vite or Next.js app
 stift check --url <url> [--dir <app>]    Verify the overlay loads from the running dev server
+stift remove [--dir <app>]               Take stift out of this project (config, .stift/, settings, .git/stift); again is a no-op
 stift dev [--command <cmd> --service <name>=<port> --needs <what> --page-url <url>]
                                          Show or record how this repository runs locally (.git/stift/dev.json)
 stift workflow [--branch-prefix <p>]     Show the feature workflow (base, branch naming, commit style), or set the prefix

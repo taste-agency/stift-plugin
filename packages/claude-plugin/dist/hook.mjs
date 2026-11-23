@@ -217,7 +217,7 @@ function trailers(message) {
 	for (const m of message.matchAll(/^([A-Za-z-]+): (.+)$/gm)) out.set(m[1], m[2].trim());
 	return out;
 }
-var Changes = class {
+var Changes = class Changes {
 	top;
 	gitDir;
 	dir;
@@ -242,6 +242,11 @@ var Changes = class {
 			if ((fs.statSync(this.dir).mode & 63) !== 0) fs.chmodSync(this.dir, 448);
 		} catch {}
 		for (const sub of ["tasks", "comments"]) fs.mkdirSync(path.join(this.dir, sub), { recursive: true });
+	}
+	/** The repository's stift state, or null when it has none (stift never listened there, or was removed): creates nothing. */
+	static existing(cwd) {
+		const gitDir = git(["rev-parse", "--absolute-git-dir"], { cwd }).out.trim();
+		return fs.existsSync(path.join(gitDir, "stift")) ? new Changes(cwd) : null;
 	}
 	/** Repository-relative POSIX path, or null outside the working tree or inside .git. */
 	relPath(file) {
@@ -1212,7 +1217,8 @@ const EDIT_TOOLS = /* @__PURE__ */ new Set([
 async function handleHook(input) {
 	const file = input.tool_input?.file_path ?? input.tool_input?.notebook_path;
 	if (input.agent_id || !EDIT_TOOLS.has(input.tool_name ?? "") || typeof file !== "string") return;
-	const ch = new Changes(input.cwd ?? process.cwd());
+	const ch = Changes.existing(input.cwd ?? process.cwd());
+	if (!ch) return;
 	if (input.hook_event_name === "PreToolUse") {
 		const active = ch.active(input.session_id);
 		if (!active) return;
