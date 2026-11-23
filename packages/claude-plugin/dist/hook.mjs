@@ -187,6 +187,8 @@ const MAIN_AGENT = "main";
 /** The trailer that marks a commit as a comment's change. */
 const COMMENT_TRAILER = "Stift-Comment";
 const REVERTS_TRAILER = "Stift-Reverts";
+/** Starts the subject of each comment's commit (":pencil2:"); not undo's reverts, nor Publish's commit of the user's own edits. */
+const COMMIT_PREFIX = "✏️ ";
 var ChangesError = class extends Error {
 	code;
 	constructor(code, message) {
@@ -745,7 +747,7 @@ var Changes = class {
 					files: [],
 					kept
 				};
-				const message = `${p.comment.message ?? `stift: ${p.comment.text ?? taskId}`}\n\n${COMMENT_TRAILER}: ${taskId}`;
+				const message = `${COMMIT_PREFIX}${p.comment.message ?? `stift: ${p.comment.text ?? taskId}`}\n\n${COMMENT_TRAILER}: ${taskId}`;
 				const commit = this.move(new Map(go.map((f) => [f.path, f.before])), new Map(go.map((f) => [f.path, f.result])), { message }, { worktree: false });
 				this.clearRedo();
 				return {
@@ -776,16 +778,17 @@ var Changes = class {
 			return stuck;
 		});
 	}
-	/** stift's commits on HEAD, newest first: comment commits not reverted since. */
-	undoable() {
+	/**
+	* stift's commits on HEAD, newest first: comment commits not reverted since. With `base` (a ref such as
+	* refs/remotes/origin/main), only those over it, as the change list shows them; nothing under it is undone.
+	*/
+	undoable(base) {
 		const out = [];
 		const reverted = /* @__PURE__ */ new Set();
 		const log = this.git([
 			"log",
-			"-n",
-			"300",
 			"--format=%H%x1f%B%x1e",
-			"HEAD"
+			...this.range(base, 300)
 		], { allowFail: true }).out;
 		for (const rec of log.split("")) {
 			const [sha, body] = rec.trim().split("");
@@ -827,15 +830,40 @@ var Changes = class {
 	clearRedo() {
 		fs.rmSync(this.stackFile(), { force: true });
 	}
+	/** The commits `git log` reads: those over `base` when it exists, else the newest `max` on HEAD. */
+	range(base, max) {
+		return base && this.git([
+			"rev-parse",
+			"-q",
+			"--verify",
+			base
+		], { allowFail: true }).status === 0 ? [`${base}..HEAD`] : [
+			"-n",
+			String(max),
+			"HEAD"
+		];
+	}
+	/** Whether undo and redo (over `base`, as `undo`) have something to do now: the page's buttons and shortcuts. */
+	can(base) {
+		if (this.blocked()) return {
+			undo: false,
+			redo: false
+		};
+		return {
+			undo: this.undoable(base).length > 0,
+			redo: this.stack().length > 0
+		};
+	}
 	/**
-	* Undoes the newest stift commit on the branch: drops it while it is HEAD and not pushed, else adds a commit that
-	* reverts it. Its hunks leave the working tree (3-way, so the user's edits stay). Returns what was undone.
+	* Undoes the newest stift commit on the branch (over `base`, when given): drops it while it is HEAD and not pushed,
+	* else adds a commit that reverts it. Its hunks leave the working tree (3-way, so the user's edits stay). Returns what
+	* was undone.
 	*/
-	undo() {
+	undo(base) {
 		return this.locked(() => {
 			const why = this.blocked();
 			if (why) throw new ChangesError("NO_BRANCH", why);
-			const target = this.undoable()[0];
+			const target = this.undoable(base)[0];
 			if (!target) throw new ChangesError("NOT_FOUND", "Nothing to undo.");
 			const paths = this.filesOf(target.sha);
 			this.busy(paths);
@@ -905,30 +933,24 @@ var Changes = class {
 		});
 	}
 	/**
-	* The branch's stift commits over `base` (a ref such as refs/remotes/origin/main), newest first: comment commits,
+	* The branch's commits over `base` (a ref such as refs/remotes/origin/main), newest first: stift's comment commits,
 	* reverts of them, and the commits undone by dropping them (from the undo stack, while the branch is where it left).
+	* With a base, the branch's other commits (not merges) are listed too, as `other`; without one only stift's, as the
+	* branch can't be told apart from the history under it.
 	*/
 	changes(base) {
-		const range = base && this.git([
-			"rev-parse",
-			"-q",
-			"--verify",
-			base
-		], { allowFail: true }).status === 0 ? [`${base}..HEAD`] : [
-			"-n",
-			"100",
-			"HEAD"
-		];
+		const range = this.range(base, 100);
+		const onBase = range.length === 1;
 		const out = [];
 		const reverted = /* @__PURE__ */ new Set();
 		const log = this.git([
 			"log",
-			"--format=%x01%H%x1f%B%x1f",
+			"--format=%x01%H%x1f%P%x1f%B%x1f",
 			"--name-only",
 			...range
 		], { allowFail: true }).out;
 		for (const rec of log.split("")) {
-			const [sha, body, names] = rec.split("");
+			const [sha, parents, body, names] = rec.split("");
 			if (!sha || !body) continue;
 			const t = trailers(body);
 			const files = (names ?? "").split("\n").filter(Boolean);
@@ -948,6 +970,14 @@ var Changes = class {
 				comment: t.get(COMMENT_TRAILER),
 				files,
 				undone: reverted.has(sha)
+			});
+			else if (onBase && !parents.includes(" ")) out.push({
+				sha,
+				subject: body.split("\n")[0],
+				comment: "",
+				files,
+				undone: false,
+				other: true
 			});
 		}
 		return [...this.stack().filter((u) => u.mode === "dropped").reverse().map((u) => {
@@ -993,7 +1023,17 @@ function handleHook(input) {
 		ch.finishEdit(MAIN_AGENT, file);
 	}
 }
+// packages/claude-plugin/src/claude/index.ts
+/**
+* Whether this hook is one `stift start` put in the project's settings for another Claude Code process (its
+* `--claude-pid`): such a hook does nothing, so it can't act for another session or outlive its own.
+*/
+const forOtherProcess = () => {
+	const i = process.argv.indexOf("--claude-pid");
+	return i > 0 && process.argv[i + 1] !== String(process.env.CLAUDE_PID ?? process.ppid);
+};
 // packages/claude-plugin/src/claude/hook.ts
+if (forOtherProcess()) process.exit(0);
 let input;
 try {
 	input = JSON.parse(fs.readFileSync(0, "utf8"));

@@ -26,7 +26,7 @@ Claude Code doesn't update plugins from third-party marketplaces by itself, so d
   claude plugin update stift@stift
   ```
 
-  Compare the version before and after. If it changed, this conversation still runs the old version: tell the person (in step 3) that stift was updated and that they run `/reload-plugins` (or restart Claude Code) to load it, but don't stop here. Continue with the command-line steps in step 2, which use the updated files under `STIFT`, and treat `/stift:setup` and `/stift:start` as not available in this conversation.
+  Compare the version before and after. If it changed, this conversation still runs the old version: treat `/stift:setup` and `/stift:start` as not available in this conversation, and use the command-line steps in steps 2 and 4, which run the updated files under `STIFT`.
 - **From another GitHub repository** (such as `taste-agency/stift`): replace it with `claude plugin uninstall stift@stift` and `claude plugin marketplace remove stift`, then install it as below.
 - **From a local directory:** it's a development install. Leave it as it is, and use that directory as `STIFT`.
 - **Not there:** install it from its public GitHub marketplace:
@@ -63,4 +63,8 @@ In a few lines, with the app's URL:
 
 ## 4. Start listening
 
-Finish by listening for changes in this same conversation, so the person can start editing right away: if `/stift:start` is available here, follow it now (it arms listening and ends the turn; stift wakes the conversation with each change, and `/stift:stop` stops it). If it isn't, because the plugin was installed or updated in step 1 and loads only in the next conversation, say instead that they need to run `/reload-plugins` and then `/stift:start` (or `/stift:start` in a new conversation in this project), and say it as the last line of your message.
+Finish by listening for changes in this same conversation, so the person can start editing right away. Listening arms and ends the turn; stift then wakes the conversation with each change.
+
+- If `/stift:start` is available here, follow it now (`/stift:stop` stops it).
+- Otherwise, because the plugin was installed or updated in step 1 and loads only in the next conversation, start it from the command line: from the project root, run `node STIFT/packages/claude-plugin/dist/stift.mjs start` with your Bash tool (in the foreground; it takes a few seconds) and follow what it prints. It runs stift's bridge and hooks for this conversation without the plugin loaded, until Claude Code exits, and says how to call stift's tools here.
+- Only if that fails, say in one line what failed, and as the last line of your message that they run `/reload-plugins` and then `/stift:start` (or `/stift:start` in a new conversation in this project).

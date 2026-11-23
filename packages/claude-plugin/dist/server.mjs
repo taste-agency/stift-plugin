@@ -198,6 +198,8 @@ const MAIN_AGENT = "main";
 /** The trailer that marks a commit as a comment's change. */
 const COMMENT_TRAILER = "Stift-Comment";
 const REVERTS_TRAILER = "Stift-Reverts";
+/** Starts the subject of each comment's commit (":pencil2:"); not undo's reverts, nor Publish's commit of the user's own edits. */
+const COMMIT_PREFIX = "✏️ ";
 var ChangesError = class extends Error {
 	code;
 	constructor(code, message) {
@@ -756,7 +758,7 @@ var Changes = class {
 					files: [],
 					kept
 				};
-				const message = `${p.comment.message ?? `stift: ${p.comment.text ?? taskId}`}\n\n${COMMENT_TRAILER}: ${taskId}`;
+				const message = `${COMMIT_PREFIX}${p.comment.message ?? `stift: ${p.comment.text ?? taskId}`}\n\n${COMMENT_TRAILER}: ${taskId}`;
 				const commit = this.move(new Map(go.map((f) => [f.path, f.before])), new Map(go.map((f) => [f.path, f.result])), { message }, { worktree: false });
 				this.clearRedo();
 				return {
@@ -787,16 +789,17 @@ var Changes = class {
 			return stuck;
 		});
 	}
-	/** stift's commits on HEAD, newest first: comment commits not reverted since. */
-	undoable() {
+	/**
+	* stift's commits on HEAD, newest first: comment commits not reverted since. With `base` (a ref such as
+	* refs/remotes/origin/main), only those over it, as the change list shows them; nothing under it is undone.
+	*/
+	undoable(base) {
 		const out = [];
 		const reverted = /* @__PURE__ */ new Set();
 		const log = this.git([
 			"log",
-			"-n",
-			"300",
 			"--format=%H%x1f%B%x1e",
-			"HEAD"
+			...this.range(base, 300)
 		], { allowFail: true }).out;
 		for (const rec of log.split("")) {
 			const [sha, body] = rec.trim().split("");
@@ -838,15 +841,40 @@ var Changes = class {
 	clearRedo() {
 		fs.rmSync(this.stackFile(), { force: true });
 	}
+	/** The commits `git log` reads: those over `base` when it exists, else the newest `max` on HEAD. */
+	range(base, max) {
+		return base && this.git([
+			"rev-parse",
+			"-q",
+			"--verify",
+			base
+		], { allowFail: true }).status === 0 ? [`${base}..HEAD`] : [
+			"-n",
+			String(max),
+			"HEAD"
+		];
+	}
+	/** Whether undo and redo (over `base`, as `undo`) have something to do now: the page's buttons and shortcuts. */
+	can(base) {
+		if (this.blocked()) return {
+			undo: false,
+			redo: false
+		};
+		return {
+			undo: this.undoable(base).length > 0,
+			redo: this.stack().length > 0
+		};
+	}
 	/**
-	* Undoes the newest stift commit on the branch: drops it while it is HEAD and not pushed, else adds a commit that
-	* reverts it. Its hunks leave the working tree (3-way, so the user's edits stay). Returns what was undone.
+	* Undoes the newest stift commit on the branch (over `base`, when given): drops it while it is HEAD and not pushed,
+	* else adds a commit that reverts it. Its hunks leave the working tree (3-way, so the user's edits stay). Returns what
+	* was undone.
 	*/
-	undo() {
+	undo(base) {
 		return this.locked(() => {
 			const why = this.blocked();
 			if (why) throw new ChangesError("NO_BRANCH", why);
-			const target = this.undoable()[0];
+			const target = this.undoable(base)[0];
 			if (!target) throw new ChangesError("NOT_FOUND", "Nothing to undo.");
 			const paths = this.filesOf(target.sha);
 			this.busy(paths);
@@ -916,30 +944,24 @@ var Changes = class {
 		});
 	}
 	/**
-	* The branch's stift commits over `base` (a ref such as refs/remotes/origin/main), newest first: comment commits,
+	* The branch's commits over `base` (a ref such as refs/remotes/origin/main), newest first: stift's comment commits,
 	* reverts of them, and the commits undone by dropping them (from the undo stack, while the branch is where it left).
+	* With a base, the branch's other commits (not merges) are listed too, as `other`; without one only stift's, as the
+	* branch can't be told apart from the history under it.
 	*/
 	changes(base) {
-		const range = base && this.git([
-			"rev-parse",
-			"-q",
-			"--verify",
-			base
-		], { allowFail: true }).status === 0 ? [`${base}..HEAD`] : [
-			"-n",
-			"100",
-			"HEAD"
-		];
+		const range = this.range(base, 100);
+		const onBase = range.length === 1;
 		const out = [];
 		const reverted = /* @__PURE__ */ new Set();
 		const log = this.git([
 			"log",
-			"--format=%x01%H%x1f%B%x1f",
+			"--format=%x01%H%x1f%P%x1f%B%x1f",
 			"--name-only",
 			...range
 		], { allowFail: true }).out;
 		for (const rec of log.split("")) {
-			const [sha, body, names] = rec.split("");
+			const [sha, parents, body, names] = rec.split("");
 			if (!sha || !body) continue;
 			const t = trailers(body);
 			const files = (names ?? "").split("\n").filter(Boolean);
@@ -959,6 +981,14 @@ var Changes = class {
 				comment: t.get(COMMENT_TRAILER),
 				files,
 				undone: reverted.has(sha)
+			});
+			else if (onBase && !parents.includes(" ")) out.push({
+				sha,
+				subject: body.split("\n")[0],
+				comment: "",
+				files,
+				undone: false,
+				other: true
 			});
 		}
 		return [...this.stack().filter((u) => u.mode === "dropped").reverse().map((u) => {
@@ -1308,7 +1338,7 @@ function detectWorkflow(top) {
 			`refs/remotes/origin/${base}`
 		]) ? `refs/remotes/origin/${base}` : "HEAD"
 	]).split("\n").filter(Boolean);
-	const types = subjects.map((s) => s.match(/^(\w+)(\([^)]*\))?!?: /)?.[1]).filter(Boolean);
+	const types = subjects.map((s) => s.replace(COMMIT_PREFIX, "").match(/^(\w+)(\([^)]*\))?!?: /)?.[1]).filter(Boolean);
 	const conventional = subjects.length >= 3 && types.length / subjects.length >= .6;
 	const type = conventional ? [...types.reduce((m, t) => m.set(t, (m.get(t) ?? 0) + 1), /* @__PURE__ */ new Map())].sort((a, b) => b[1] - a[1])[0][0] : null;
 	return {
@@ -1368,6 +1398,11 @@ function commitMessage(w, c) {
 	const prefix = w.commitStyle.conventional ? `${w.commitStyle.type ?? "chore"}: ` : "";
 	return `${oneLine(prefix + what(c), 72)}\n\nMade with stift from a comment on the running app.`;
 }
+/**
+* The ref the change list and undo start over: origin's base (the local base without a remote), so neither reaches
+* the history under the feature. On the base itself, HEAD: nothing.
+*/
+const listBase = (w, branch) => branch === w.base ? "HEAD" : w.remote ? `refs/remotes/origin/${w.base}` : `refs/heads/${w.base}`;
 /** A feature branch name from a short name or a comment: the prefix, then a slug of up to 32 characters. */
 function featureBranch(w, name) {
 	const full = name.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -1400,7 +1435,7 @@ const git$1 = (top, args) => {
 };
 const errLine = (e) => {
 	const err = e;
-	return (err.stderr || err.message).trim().split("\n").filter((l) => l && !/^(hint|Aborting|Please commit)/.test(l))[0] ?? "git failed";
+	return String(err.stderr || err.message).trim().split("\n").filter((l) => l && !/^(hint|Aborting|Please commit)/.test(l))[0] ?? "git failed";
 };
 const file$1 = (gitDir) => path.join(gitDir, "stift", "features.json");
 function loadFeatures(gitDir) {
@@ -1437,7 +1472,10 @@ function recordFeature(gitDir, branch, pr) {
 		});
 	});
 }
-/** The feature branches stift knows that still exist (locally or on origin), newest commit first. */
+/**
+* The feature branches stift knows that still exist (locally or on origin), newest commit first. Merged or closed ones
+* are left out, except the branch checked out: it stays, showing its state, until the user leaves it.
+*/
 function listFeatures(top, gitDir, w) {
 	const known = loadFeatures(gitDir);
 	const current = git$1(top, [
@@ -1449,6 +1487,7 @@ function listFeatures(top, gitDir, w) {
 	const out = [];
 	for (const [branch, r] of Object.entries(known)) {
 		if (branch === w.base) continue;
+		if ((r.state === "merged" || r.state === "closed") && branch !== current) continue;
 		const at = git$1(top, [
 			"log",
 			"-1",
@@ -1482,7 +1521,7 @@ const isAncestor = (top, a, b) => git$1(top, [
 ]) !== null;
 /**
 * Checks the reviewed features' pull requests, each at most once a minute (or `maxAge`): merged or closed ones end and
-* stay listed. Branches are never deleted. Returns whether anything changed.
+* leave the list (`listFeatures`). Branches are never deleted. Returns whether anything changed.
 */
 async function refreshFeatures(top, gitDir, w, o) {
 	const all = loadFeatures(gitDir);
@@ -1538,6 +1577,233 @@ async function refreshFeatures(top, gitDir, w, o) {
 	}
 	saveFeatures(gitDir, fresh);
 	return changed;
+}
+/**
+* Whether a -U0 hunk is stift's dev integration: the lines it adds are the config wrapper, the plugin line or their
+* import (they mention stift), or bare closing brackets of a wrapper that spans lines. What it replaces doesn't matter
+* (`export default config` becomes `export default stift.withStift(config)`).
+*/
+function integrationHunk(h) {
+	const added = h.split("\n").slice(1).filter((l) => l.startsWith("+")).map((l) => l.slice(1));
+	return added.some((l) => /stift/i.test(l)) && added.every((l) => /stift/i.test(l) || /^[\s)}\];,]*$/.test(l));
+}
+/** The uncommitted diff against HEAD in -U0 hunks, per file, and the untracked files (not ignored). */
+function localDiff(top) {
+	const tracked = /* @__PURE__ */ new Map();
+	let diff = "";
+	try {
+		diff = execFileSync("git", [
+			"diff",
+			"HEAD",
+			"-U0",
+			"--no-color",
+			"--no-ext-diff",
+			"--no-renames",
+			"--binary"
+		], {
+			cwd: top,
+			encoding: "utf8",
+			stdio: [
+				"ignore",
+				"pipe",
+				"ignore"
+			],
+			env: env(),
+			maxBuffer: 64 << 20
+		});
+	} catch {}
+	for (const part of diff.split(/^(?=diff --git )/m).filter(Boolean)) {
+		const name = part.match(/^\+\+\+ b\/(.+)$/m)?.[1] ?? part.match(/^--- a\/(.+)$/m)?.[1] ?? part.match(/^diff --git a\/(.+?) b\//)?.[1];
+		if (!name) continue;
+		const at = part.search(/^@@ /m);
+		tracked.set(name, at < 0 ? {
+			head: part,
+			hunks: []
+		} : {
+			head: part.slice(0, at),
+			hunks: part.slice(at).split(/^(?=@@ )/m)
+		});
+	}
+	return {
+		tracked,
+		untracked: (git$1(top, [
+			"ls-files",
+			"-z",
+			"--others",
+			"--exclude-standard"
+		]) ?? "").split("\0").filter(Boolean)
+	};
+}
+/** A file's hunks that are the user's: stift's integration hunks left out. */
+const ownHunks = (hunks) => hunks.filter((h) => !integrationHunk(h));
+/**
+* The user's uncommitted edits (staged, unstaged and new files), without stift's dev integration (its config lines;
+* `.stift/` is excluded already): what a switch asks about. Repository-relative paths.
+*/
+function localChanges(top) {
+	const { tracked, untracked } = localDiff(top);
+	return [...[...tracked].filter(([, d]) => !d.hunks.length || ownHunks(d.hunks).length).map(([f]) => f), ...untracked].sort();
+}
+/**
+* The user's own edits as one patch against HEAD (-U0, stift's integration hunks left out), and the new files: what
+* Publish commits and what the session summarizes.
+*/
+function localPatch(top) {
+	const { tracked, untracked } = localDiff(top);
+	return {
+		patch: [...tracked.values()].map((d) => {
+			if (!d.hunks.length) return d.head;
+			const own = ownHunks(d.hunks);
+			return own.length ? d.head + own.join("") : "";
+		}).join(""),
+		untracked
+	};
+}
+/**
+* Publish on a switch: the user's uncommitted edits (as `localChanges`, stift's integration left out) become one commit
+* on the branch checked out. The working tree stays as it is; the index matches the new commit.
+*/
+function commitLocal(top, message) {
+	const { patch, untracked } = localPatch(top);
+	const files = localChanges(top);
+	if (!files.length) return {
+		ok: false,
+		error: "There are no edits to publish."
+	};
+	try {
+		execFileSync("git", ["reset", "-q"], {
+			cwd: top,
+			stdio: "ignore",
+			env: env()
+		});
+		if (patch) execFileSync("git", [
+			"apply",
+			"--cached",
+			"--unidiff-zero",
+			"--binary"
+		], {
+			cwd: top,
+			input: patch,
+			stdio: [
+				"pipe",
+				"ignore",
+				"pipe"
+			],
+			env: env()
+		});
+		if (untracked.length) execFileSync("git", [
+			"add",
+			"--",
+			...untracked
+		], {
+			cwd: top,
+			stdio: "ignore",
+			env: env()
+		});
+		execFileSync("git", [
+			"commit",
+			"-q",
+			"--no-verify",
+			"-m",
+			message
+		], {
+			cwd: top,
+			stdio: [
+				"ignore",
+				"ignore",
+				"pipe"
+			],
+			env: env()
+		});
+		return {
+			ok: true,
+			files
+		};
+	} catch (e) {
+		git$1(top, ["reset", "-q"]);
+		return {
+			ok: false,
+			error: errLine(e)
+		};
+	}
+}
+/**
+* The switch git refused: the edits go into a stash, the branch is switched, and the stash is popped onto it. Where the
+* edits clash with the branch, the files get conflict markers (the index is left clean) and the stash is kept: `clash`
+* says so. Undone when the switch itself fails.
+*/
+async function switchStashed(top, branch) {
+	const before = git$1(top, [
+		"rev-parse",
+		"-q",
+		"--verify",
+		"refs/stash"
+	]);
+	await run("git", [
+		"stash",
+		"push",
+		"-q",
+		"-m",
+		`stift: edits carried to ${branch}`
+	], {
+		cwd: top,
+		env: env()
+	});
+	if (git$1(top, [
+		"rev-parse",
+		"-q",
+		"--verify",
+		"refs/stash"
+	]) === before) return {
+		ok: false,
+		error: "There was nothing to stash."
+	};
+	try {
+		await run("git", [
+			"switch",
+			"-q",
+			branch
+		], {
+			cwd: top,
+			env: env()
+		});
+	} catch (e) {
+		await run("git", [
+			"stash",
+			"pop",
+			"-q",
+			"--index"
+		], {
+			cwd: top,
+			env: env()
+		}).catch(() => {});
+		return {
+			ok: false,
+			error: errLine(e)
+		};
+	}
+	try {
+		await run("git", [
+			"stash",
+			"pop",
+			"-q"
+		], {
+			cwd: top,
+			env: env()
+		});
+		return { ok: true };
+	} catch (e) {
+		const clashed = (git$1(top, [
+			"diff",
+			"--name-only",
+			"--diff-filter=U"
+		]) ?? "").split("\n").filter(Boolean);
+		git$1(top, ["reset", "-q"]);
+		return {
+			ok: true,
+			clash: clashed.length ? `Your edits clash with ${branch} in ${clashed.join(", ")}: resolve the conflict markers there. A copy stays in git stash.` : `Your edits couldn't be put back on ${branch} (${errLine(e)}). They are in git stash: git stash pop.`
+		};
+	}
 }
 /**
 * `git switch` arguments that carry the uncommitted edits to `target`. Files edited here that differ on `target` (such
@@ -1618,9 +1884,10 @@ function carry(top, target) {
 }
 /**
 * Switches the user's checkout to a feature branch (or the base), carrying uncommitted edits along. Git refuses when
-* they would clash with the branch; then nothing changed, and the reason is git's. A branch only on origin is fetched.
+* they would clash with the branch; then nothing changed, and the reason is git's, unless `stash`: then the edits are
+* stashed, the branch switched and the stash popped (`switchStashed`). A branch only on origin is fetched.
 */
-async function switchTo(top, branch) {
+async function switchTo(top, branch, o = {}) {
 	try {
 		if (!git$1(top, [
 			"rev-parse",
@@ -1649,15 +1916,20 @@ async function switchTo(top, branch) {
 			"--verify",
 			`refs/heads/${branch}`
 		]) ? branch : `origin/${branch}`;
-		await run("git", [
-			"switch",
-			"-q",
-			...carry(top, target),
-			branch
-		], {
-			cwd: top,
-			env: env()
-		});
+		try {
+			await run("git", [
+				"switch",
+				"-q",
+				...carry(top, target),
+				branch
+			], {
+				cwd: top,
+				env: env()
+			});
+		} catch (e) {
+			if (!o.stash) throw e;
+			return await switchStashed(top, branch);
+		}
 		return { ok: true };
 	} catch (e) {
 		return {
@@ -1671,27 +1943,49 @@ async function switchTo(top, branch) {
 * origin's when it has nothing of its own; the branch is made on the first comment, named after it (as for any
 * comment on the base). A base that can't be fast-forwarded without touching the edits stays where it is.
 */
-async function startUnnamed(top, w) {
-	if (w.remote) await run("git", [
-		"fetch",
-		"-q",
-		"--no-tags",
-		"origin",
-		`+refs/heads/${w.base}:refs/remotes/origin/${w.base}`
-	], {
-		cwd: top,
-		env: env(),
-		timeout: 3e4
-	}).catch(() => {});
+async function startUnnamed(top, w, o = {}) {
+	await fetchBase(top, w);
+	let r = { ok: true };
 	if (git$1(top, [
 		"symbolic-ref",
 		"-q",
 		"--short",
 		"HEAD"
 	]) !== w.base) {
-		const r = await switchTo(top, w.base);
+		r = await switchTo(top, w.base, o);
 		if (!r.ok) return r;
 	}
+	if (!r.clash) await fastForwardBase(top, w);
+	return r;
+}
+/** Fetches origin's base, when there is an origin, for at most `ms`. Offline, or past that, it stays as it was. */
+const fetchBase = (top, w, ms = 3e4) => w.remote ? run("git", [
+	"fetch",
+	"-q",
+	"--no-tags",
+	"origin",
+	`+refs/heads/${w.base}:refs/remotes/origin/${w.base}`
+], {
+	cwd: top,
+	env: env(),
+	timeout: ms
+}).then(() => {}, () => {}) : Promise.resolve();
+/**
+* How long a comment on the base waits for origin's base before its feature starts from the local one. A fetch of one
+* ref takes well under a second online; offline, git can hang until the TCP timeout, so the comment can't wait for it.
+*/
+const COMMENT_FETCH_MS = 2e3;
+/**
+* Fast-forwards the base, checked out, to origin's when it has nothing of its own. A fast-forward that would touch the
+* uncommitted edits is skipped, so the base stays where it is.
+*/
+async function fastForwardBase(top, w) {
+	if (git$1(top, [
+		"symbolic-ref",
+		"-q",
+		"--short",
+		"HEAD"
+	]) !== w.base) return;
 	const local = git$1(top, [
 		"rev-parse",
 		"-q",
@@ -1713,7 +2007,14 @@ async function startUnnamed(top, w) {
 		cwd: top,
 		env: env()
 	}).catch(() => {});
-	return { ok: true };
+}
+/**
+* Brings the base checked out up to origin's before a comment starts a feature on it (`startFeatureHere`). When origin
+* doesn't answer within COMMENT_FETCH_MS (offline), the base stays as it is and the feature starts from it.
+*/
+async function updateBase(top, w) {
+	await fetchBase(top, w, COMMENT_FETCH_MS);
+	await fastForwardBase(top, w);
 }
 /** A feature branch name not taken locally or on origin. */
 function freeName(top, w, name) {
@@ -1733,7 +2034,8 @@ function freeName(top, w, name) {
 }
 /**
 * A comment arrived on the base branch: its feature starts here, from the commit checked out, named after the comment,
-* with the uncommitted edits carried along. Synchronous and local (no fetch), as the session is about to edit.
+* with the uncommitted edits carried along. Synchronous and local, as the session is about to edit: the bridge brought
+* the base up to origin's before (`updateBase`).
 */
 function startFeatureHere(top, gitDir, w, name) {
 	const branch = freeName(top, w, name);
@@ -1802,6 +2104,17 @@ async function pushForReview(top, gitDir, w, branch, step) {
 	});
 	if (!commits.length) throw new Error(`Nothing to review: ${branch} has no commits that aren't on ${w.base}.`);
 	step?.(`Pushing ${branch}`);
+	await pushBranch(top, branch, "Review");
+	const pr = loadFeatures(gitDir)[branch];
+	return {
+		branch,
+		base: w.base,
+		commits,
+		...pr?.url && pr.state === "open" ? { pr: pr.url } : {}
+	};
+}
+/** Pushes `branch` to origin and tracks it there. `again`: what to try again after pulling, when origin is ahead. */
+async function pushBranch(top, branch, again) {
 	try {
 		await run("git", [
 			"push",
@@ -1815,16 +2128,32 @@ async function pushForReview(top, gitDir, w, branch, step) {
 			timeout: 12e4
 		});
 	} catch (e) {
-		if (/rejected|non-fast-forward|fetch first/.test(e.stderr ?? "")) throw new Error(`origin has newer commits on ${branch}: pull them (git pull --rebase), then Review again.`);
+		if (/rejected|non-fast-forward|fetch first/.test(e.stderr ?? "")) throw new Error(`origin has newer commits on ${branch}: pull them (git pull --rebase), then ${again} again.`);
 		throw e;
 	}
-	const pr = loadFeatures(gitDir)[branch];
-	return {
-		branch,
-		base: w.base,
-		commits,
-		...pr?.url && pr.state === "open" ? { pr: pr.url } : {}
-	};
+}
+/** How much of the user's diff goes into the summary brief; the session reads more with git diff if it needs to. */
+const SUMMARY_PATCH_MAX = 12e3;
+/**
+* The session's job when the user switches with edits of their own: a tl;dr of them for the question on the page,
+* written for people who know the project well, and a commit subject in case they publish them.
+*/
+function summaryBrief(files, p, w) {
+	const patch = p.patch.length > SUMMARY_PATCH_MAX ? `${p.patch.slice(0, SUMMARY_PATCH_MAX)}\n… (cut; run git diff HEAD -- <file> for the rest)` : p.patch;
+	const style = w?.commitStyle.examples.length ? ` Recent subjects, for style: ${w.commitStyle.examples.slice(0, 3).map((s) => JSON.stringify(s)).join(", ")}.` : "";
+	return `The user is switching branches in stift and has uncommitted edits of their own (not made through stift) in:
+${files.map((f) => `- ${f}`).join("\n")}
+
+The diff against HEAD (stift's dev integration left out)${p.untracked.length ? `; new files are listed above, read them if you need to` : ""}:
+\`\`\`diff
+${patch.trim() || "(only new files)"}
+\`\`\`
+
+Call report_summary with:
+- summary: a tl;dr of what these edits do, at most 200 words (fewer is better), for someone who knows this project well: name the components and behaviour, not the lines. Plain text, no file list (the user sees the files already).
+- subject: a one-line commit subject for them, in this repository's style.${style}
+
+Only read: don't edit files, run git commands that change anything, commit, stash or switch branches.`;
 }
 /**
 * The session's job: open the pull request for the pushed branch with its own tools (a PR skill, command or plugin it
@@ -13738,6 +14067,10 @@ async function readTurn(transcript, since) {
 const MAX_ATTEMPTS = 2;
 /** The active id while the session opens or updates a pull request. */
 const REVIEW = "review";
+/** The active id while the session summarizes the user's own edits before a switch. */
+const SUMMARY = "summary";
+/** The active id while the session fixes an error the page showed (Fix in Claude). */
+const FIX_ERROR = "fix-error";
 /** The file the bridge advertises itself in, read by the Vite plugin. */
 const bridgeFile = (gitDir) => path.join(gitDir, "stift", "bridge.json");
 /**
@@ -13776,6 +14109,13 @@ var Bridge = class {
 	switching;
 	/** The pushed branch waiting for the session to open or update its pull request (`brief`), or in its hands. */
 	reviewJob = null;
+	/** An error the page showed that the user asked the session to fix (Fix in Claude). */
+	errorJob = null;
+	/** The last undo or redo that failed, for Fix in Claude. */
+	historyError = null;
+	/** The user's edits to summarize before a switch (`brief`), until the session takes it; `subject` is its commit subject. */
+	summaryJob = null;
+	summarySubject;
 	/** HEAD when the change list was last sent: a commit or switch by anyone else sends it again. */
 	lastHead = null;
 	/** Why comments wait now (a rebase in progress, a detached HEAD), as last told to the pages. */
@@ -13788,6 +14128,8 @@ var Bridge = class {
 	transcript;
 	/** The session id the owning session's hooks send now (it changes on /clear and resume): edits are recorded for it only. */
 	hookSession;
+	/** The base being brought up to origin's before a comment starts a feature on it (`updatingBase`). */
+	baseUpdate = null;
 	constructor(repoDir, opts = {}) {
 		this.cl = new Changes(repoDir);
 		this.opts = opts;
@@ -13882,6 +14224,7 @@ var Bridge = class {
 	}
 	/** Another session started listening in this repository: hand it the port. */
 	async release() {
+		this.opts.onRelease?.();
 		this.armed = false;
 		this.listening = false;
 		this.answer("released");
@@ -13941,6 +14284,10 @@ var Bridge = class {
 			this.hookRequest(url.pathname, req, res);
 			return;
 		}
+		if (req.method === "POST" && url.pathname === "/tool" && this.opts.tool && sameToken(req.headers["x-stift-token"], this.token)) {
+			this.toolRequest(req, res);
+			return;
+		}
 		res.writeHead(404).end();
 	}
 	async hookRequest(route, req, res) {
@@ -13969,6 +14316,23 @@ var Bridge = class {
 			kind: "wake",
 			wake: a
 		});
+	}
+	async toolRequest(req, res) {
+		const json = (code, v) => res.writeHead(code, { "content-type": "application/json" }).end(JSON.stringify(v));
+		let body;
+		try {
+			let text = "";
+			for await (const chunk of req) text += chunk;
+			body = JSON.parse(text);
+		} catch {
+			return res.writeHead(400).end();
+		}
+		if (!this.owns(body.session, body.pid)) return json(403, { error: "This stift bridge belongs to another Claude Code session." });
+		try {
+			json(200, { text: await this.opts.tool(String(body.name ?? ""), body.args ?? {}) });
+		} catch (e) {
+			json(200, { error: e.message });
+		}
 	}
 	/** Whether a hook's session is the one this bridge belongs to. */
 	owns(session, pid) {
@@ -14081,14 +14445,19 @@ var Bridge = class {
 			else if (msg.type === "text-edit") this.addTextEdit(msg.payload, conn.origin);
 			else if (msg.type === "verified") this.verified(msg.id, msg.attempt, msg);
 			else if (msg.type === "release") this.answerHeld(msg.apply, msg.discard);
-			else if (msg.type === "undo" || msg.type === "redo") this.send({
-				type: "notice",
-				text: this.history(msg.type)
-			}, conn);
-			else if (msg.type === "review") this.review();
+			else if (msg.type === "undo" || msg.type === "redo") {
+				const text = this.history(msg.type);
+				this.send({
+					type: "notice",
+					text,
+					...this.historyError === text ? { fix: "history" } : {}
+				}, conn);
+			} else if (msg.type === "review") this.review();
 			else if (msg.type === "features") this.refreshFeatures(1e4);
-			else if (msg.type === "switch") this.switchFeature(msg.branch);
-			else if (msg.type === "new-feature") this.newFeature();
+			else if (msg.type === "switch") this.requestSwitch(msg.branch);
+			else if (msg.type === "new-feature") this.requestSwitch(null);
+			else if (msg.type === "switch-answer") this.answerSwitch(msg.answer);
+			else if (msg.type === "fix") this.fixError(msg.error, conn);
 		};
 	}
 	send(msg, to) {
@@ -14390,7 +14759,9 @@ var Bridge = class {
 	}
 	/** Wakes the waiting session when there is something for it to do: the next comment or review, while none is in its hands. */
 	kick() {
-		if (this.hold && !this.activeId && (this.queue().length || this.reviewJob)) this.answer(this.take());
+		if (!this.hold || this.activeId || !(this.queue().length || this.reviewJob || this.summaryJob || this.errorJob)) return;
+		const w = this.take();
+		if (w.job || w.lines.length) this.answer(w);
 	}
 	answer(a) {
 		const h = this.hold;
@@ -14400,6 +14771,22 @@ var Bridge = class {
 	/** The next comment when none is in the session's hands, its ▶ line, and a line for each newly queued one. */
 	take() {
 		const lines = [];
+		if (!this.activeId && this.summaryJob) {
+			const j = this.summaryJob;
+			this.summaryJob = null;
+			this.activeId = SUMMARY;
+			this.cl.setActive(null);
+			lines.push(`▶ stift summary · your edits in ${j.files.length} file${j.files.length > 1 ? "s" : ""}, before switching branches`);
+			return {
+				lines,
+				job: {
+					kind: "summary",
+					id: SUMMARY,
+					n: 0,
+					brief: j.brief
+				}
+			};
+		}
 		if (!this.activeId && this.reviewJob) {
 			const p = this.reviewJob;
 			this.activeId = REVIEW;
@@ -14415,16 +14802,33 @@ var Bridge = class {
 				}
 			};
 		}
+		if (!this.activeId && this.errorJob) {
+			const e = this.errorJob;
+			this.errorJob = null;
+			this.activeId = FIX_ERROR;
+			this.cl.setActive(null);
+			lines.push(`▶ stift fix · ${short(e.title, 80)}`);
+			return {
+				lines,
+				job: {
+					kind: "error",
+					id: FIX_ERROR,
+					n: 0,
+					brief: e.brief
+				}
+			};
+		}
 		const why = this.cl.blocked();
 		if (why !== this.blockedWhy) {
 			this.blockedWhy = why;
 			for (const c of this.queue()) this.setStatus(c, c.record.status, why ? `Waiting · ${why}` : void 0);
 		}
-		const next = this.activeId || why ? void 0 : this.queue()[0];
+		const first = this.activeId || why ? void 0 : this.queue()[0];
+		const next = first && this.updatingBase(first) ? void 0 : first;
 		const job = next ? this.dispatch(next) : null;
 		if (next) lines.push(this.startLine(next));
 		for (const c of this.queue()) {
-			if (c.announced) continue;
+			if (c.announced || c === first && !next) continue;
 			c.announced = true;
 			lines.push(`· stift #${c.n} queued · ${c.record.ahead} ahead`);
 		}
@@ -14495,6 +14899,15 @@ var Bridge = class {
 	* done it already), and goes to the page. A turn that changed nothing fails the comment, unless the session settled it.
 	*/
 	finishActive() {
+		if (this.activeId === SUMMARY) {
+			this.activeId = null;
+			const sw = this.switching;
+			if (sw?.phase === "asking" && sw.summarizing) this.say({
+				...sw,
+				summarizing: false
+			});
+			return;
+		}
 		if (this.activeId === REVIEW) {
 			this.activeId = null;
 			const p = this.reviewJob;
@@ -14505,6 +14918,16 @@ var Bridge = class {
 				note: "The title and description were not updated."
 			});
 			else if (p) this.reviewFailed("The session ended its turn without opening the pull request.");
+			return;
+		}
+		if (this.activeId === FIX_ERROR) {
+			this.activeId = null;
+			this.send({
+				type: "notice",
+				text: "Claude Code tried a fix · see its reply"
+			});
+			this.sendFeatures();
+			this.sendChanges();
 			return;
 		}
 		const c = this.activeId ? this.comments.get(this.activeId) : void 0;
@@ -14581,6 +15004,27 @@ var Bridge = class {
 			this.telemetry.error(e, "generation", c.record.payload.id);
 		}
 	}
+	/**
+	* Whether the comment waits while the base is brought up to origin's: it is about to start a feature on the base
+	* (`onFeature`), which shouldn't start from a stale base. The first time, it starts the update; the session gets the
+	* comment once it's done.
+	*/
+	updatingBase(c) {
+		if (c.next !== "comment" || c.baseUpdated) return false;
+		let w;
+		try {
+			w = this.wf();
+		} catch {
+			return false;
+		}
+		if (!w.remote || this.cl.branch() !== w.base) return false;
+		this.baseUpdate ??= updateBase(this.cl.top, w).finally(() => {
+			this.baseUpdate = null;
+			for (const q of this.queue()) q.baseUpdated = true;
+			this.kick();
+		});
+		return true;
+	}
 	/** A comment on the base branch: its feature branch starts now, named after it (uncommitted edits ride along). */
 	onFeature(c) {
 		let w;
@@ -14635,7 +15079,51 @@ var Bridge = class {
 		if (!c) throw new Error(`No comment ${id}.`);
 		const p = c.record.payload;
 		if (c.next === "fix") return fixPrompt(p, c.record.files ?? [], c.errors);
-		return p.kind === "exact-edit" ? exactEditPrompt(p) : commentPrompt(p);
+		const brief = p.kind === "exact-edit" ? exactEditPrompt(p) : commentPrompt(p);
+		return c.failedBefore ? `${brief}\n\nAn earlier attempt at this failed, and the user asked you to try again: ${pageData(c.failedBefore)}\nAddress that this time.` : brief;
+	}
+	/**
+	* Fix in Claude: the user asks the listening session to fix an error the page shows. The page names the error only;
+	* its text comes from the bridge's own record of it. A failed comment is queued again as a new attempt, with why the
+	* last one failed; any other error becomes one turn for the session (`errorJob`), and leaves the page.
+	*/
+	fixError(e, conn) {
+		const tell = (text) => this.send({
+			type: "notice",
+			text
+		}, conn);
+		if (!this.listening) return tell("Can't fix it · Claude Code isn't listening: run /stift:start");
+		if (e.kind === "comment") {
+			const c = this.comments.get(e.id);
+			if (!c || c.phase !== "settled" || c.record.status !== "failed") return tell("That change is no longer failed");
+			c.failedBefore = c.record.message ?? "No reason was given.";
+			c.attempt = 0;
+			c.errors = [];
+			return this.enqueue(c, "comment");
+		}
+		let title;
+		let reason;
+		const r = this.reviewState;
+		const sw = this.switching;
+		if (e.kind === "review" && r.phase === "failed") {
+			[title, reason] = ["Publish failed", r.reason];
+			this.setReview({ phase: "idle" });
+		} else if (e.kind === "switch" && sw?.phase === "failed") {
+			[title, reason] = ["Can't switch branches", sw.reason];
+			this.say(void 0);
+		} else if (e.kind === "switch" && sw?.phase === "clashed") {
+			[title, reason] = [`Switched to ${sw.branch}, but the edits put back clash with it`, sw.reason];
+			this.say(void 0);
+		} else if (e.kind === "history" && this.historyError) {
+			[title, reason] = [this.historyError.split(" · ")[0], this.historyError];
+			this.historyError = null;
+		} else return tell("That error is gone already");
+		this.errorJob = {
+			title,
+			brief: errorBrief(title, reason, this.cl.top)
+		};
+		tell(`Sent to Claude Code · ${title}`);
+		this.kick();
 	}
 	/** The session gives up on a comment, or settles it without a change. */
 	report(id, status, message) {
@@ -14685,13 +15173,13 @@ var Bridge = class {
 		});
 	}
 	/**
-	* Undo (the newest stift commit on the branch) or redo (the last undo, while the branch didn't move since), from the
-	* page or the session. Returns the line for the bar.
+	* Undo (the newest stift commit the change list shows) or redo (the last undo, while the branch didn't move since),
+	* from the page's buttons and shortcuts or the session. Returns the line for the bar.
 	*/
 	history(verb) {
 		let line;
 		try {
-			const r = verb === "undo" ? this.cl.undo() : this.cl.redo();
+			const r = verb === "undo" ? this.cl.undo(this.listBase()) : this.cl.redo();
 			line = `${verb === "undo" ? "Undid" : "Redid"} ${this.changeName(r.comment, r.subject)}${"mode" in r && r.mode === "reverted" ? " · it was pushed, so a revert commit undoes it" : ""}`;
 			this.telemetry.capture(verb === "undo" ? "comment_undone" : "comment_redone", {
 				trace: r.comment,
@@ -14700,10 +15188,11 @@ var Bridge = class {
 		} catch (e) {
 			if (e instanceof ChangesError && e.code === "NOT_FOUND") return verb === "undo" ? "Nothing to undo" : "Nothing to redo";
 			if (e instanceof ChangesError && e.code === "BUSY") return `Busy · ${e.message} Try again when it's done.`;
-			if (e instanceof ChangesError && e.code === "CONFLICT") return `Can't ${verb} · ${e.message} Nothing was changed.`;
+			if (e instanceof ChangesError && e.code === "CONFLICT") return this.historyError = `Can't ${verb} · ${e.message} Nothing was changed.`;
 			this.telemetry.error(e, verb);
-			return `Can't ${verb} · ${firstLine(e.message)}`;
+			return this.historyError = `Can't ${verb} · ${firstLine(e.message)}`;
 		}
+		this.historyError = null;
 		this.pushReverted();
 		this.sendFeatures();
 		this.sendChanges();
@@ -14841,11 +15330,13 @@ var Bridge = class {
 	featuresState() {
 		let base = null;
 		let list = [];
+		let ended = false;
 		const branch = this.cl.branch();
 		try {
 			const w = this.wf();
 			base = w.base;
 			list = listFeatures(this.cl.top, this.cl.gitDir, w);
+			ended = Object.entries(loadFeatures(this.cl.gitDir)).some(([b, r]) => b !== branch && (r.state === "merged" || r.state === "closed"));
 		} catch {}
 		let current = list.find((f) => f.branch === branch) ?? null;
 		if (!current && branch && branch !== base) list.unshift(current = {
@@ -14858,6 +15349,7 @@ var Bridge = class {
 			base,
 			current,
 			list,
+			...ended ? { ended } : {},
 			...this.switching ? { switching: this.switching } : {}
 		};
 	}
@@ -14867,19 +15359,24 @@ var Bridge = class {
 			state: this.featuresState()
 		}, to);
 	}
-	/** The change list: the branch's stift commits over origin's base, read from git. */
-	sendChanges(to) {
-		let base = null;
+	/** What the change list and undo cover (`listBase`); null when the workflow is unknown. */
+	listBase() {
 		try {
-			const w = this.wf();
-			base = w.remote ? `refs/remotes/origin/${w.base}` : `refs/heads/${w.base}`;
-		} catch {}
-		const head = this.cl.head();
-		const changes = this.cl.branch() === base?.split("/").pop() ? [] : this.cl.changes(base);
-		this.lastHead = head;
+			return listBase(this.wf(), this.cl.branch());
+		} catch {
+			return null;
+		}
+	}
+	/** The change list: the branch's stift commits over origin's base, read from git, and whether undo and redo can go. */
+	sendChanges(to) {
+		const base = this.listBase();
+		this.lastHead = this.cl.head();
+		const can = this.cl.can(base);
 		this.send({
 			type: "changes",
-			changes
+			changes: this.cl.changes(base),
+			canUndo: can.undo,
+			canRedo: can.redo
 		}, to);
 	}
 	/** Checks the reviewed features' pull requests (cached a minute each, `maxAge`), and tells the pages when one changed. */
@@ -14892,62 +15389,172 @@ var Bridge = class {
 			})) this.sendFeatures();
 		} catch {}
 	}
-	/** Why the checkout can't change now, or null. */
+	/** Why the checkout can't change now, or null. A summary in the session's hands doesn't count: it only reads. */
 	busySwitching() {
 		if (this.switching?.phase === "switching") return "A switch is in progress.";
-		if (this.activeId || this.cl.activeTasks().length) return "A change is in progress: switch when it is done.";
+		if (this.activeId && this.activeId !== SUMMARY || this.cl.activeTasks().length) return "A change is in progress: switch when it is done.";
 		return null;
 	}
 	say(sw) {
 		this.switching = sw;
 		this.sendFeatures();
 	}
-	/** The shelf: switch to a feature (plain git switch; uncommitted edits ride along, git refuses when they'd clash). */
-	async switchFeature(branch) {
+	/**
+	* The shelf asks to switch to `to` (a feature branch), or to a new, unnamed feature (null). With uncommitted edits of
+	* the user's own (stift's integration left out), it asks first (`answerSwitch`): Publish commits them on the feature
+	* checked out, Keep carries them along uncommitted. The listening session writes their tl;dr meanwhile.
+	*/
+	requestSwitch(to) {
 		const busy = this.busySwitching();
 		if (busy) return this.say({
 			phase: "failed",
 			reason: busy
 		});
-		this.say({
-			phase: "switching",
-			branch
-		});
-		const r = await switchTo(this.cl.top, branch);
-		this.switching = r.ok ? void 0 : {
-			phase: "failed",
-			reason: r.error
-		};
-		this.watchBranch();
-		this.sendFeatures();
-	}
-	/** The shelf's +: a new, unnamed feature on the base; the first comment makes its branch, named after it. */
-	async newFeature() {
-		const busy = this.busySwitching();
-		if (busy) return this.say({
-			phase: "failed",
-			reason: busy
-		});
-		let r;
+		let files = [];
 		try {
-			const w = this.wf();
-			this.say({
-				phase: "switching",
-				branch: w.base
+			files = localChanges(this.cl.top);
+		} catch {}
+		if (!files.length) return void this.doSwitch(to, false);
+		let w = null;
+		try {
+			w = this.wf();
+		} catch {}
+		const b = this.cl.branch();
+		const publish = b && w && b !== w.base ? b : void 0;
+		const prev = this.switching?.phase === "asking" && this.switching.files.join("\0") === files.join("\0") ? this.switching : null;
+		if (!prev) this.summarySubject = void 0;
+		const summarizing = prev ? !!prev.summarizing : this.listening;
+		this.say({
+			phase: "asking",
+			to,
+			files,
+			...publish ? { publish } : {},
+			...prev?.summary ? { summary: prev.summary } : {},
+			...summarizing ? { summarizing } : {}
+		});
+		if (prev || !this.listening) return;
+		this.summaryJob = {
+			files,
+			brief: summaryBrief(files, localPatch(this.cl.top), w)
+		};
+		this.kick();
+	}
+	/** The session's tl;dr of the user's edits (`report_summary`), for the question on the page. */
+	reportSummary(a) {
+		const sw = this.switching;
+		if (sw?.phase !== "asking") return "The user already answered: nothing more to do.";
+		const words = (a.summary ?? "").trim().split(/[ \t]+/);
+		const summary = words.length > 200 ? `${words.slice(0, 200).join(" ")}…` : words.join(" ");
+		this.summarySubject = a.subject?.trim().split("\n")[0] || void 0;
+		this.say({
+			phase: "asking",
+			to: sw.to,
+			files: sw.files,
+			...sw.publish ? { publish: sw.publish } : {},
+			...summary ? { summary } : {}
+		});
+		return "The user sees the summary in the browser.";
+	}
+	/**
+	* The user's answer: Publish (commit their edits on the feature and push it, with any commits not pushed yet, then
+	* switch), Keep (switch, edits stay uncommitted) or Cancel.
+	*/
+	async answerSwitch(answer) {
+		const sw = this.switching;
+		if (sw?.phase !== "asking") return;
+		this.summaryJob = null;
+		if (answer === "cancel") return this.say(void 0);
+		const busy = this.busySwitching();
+		if (busy) return this.say({
+			phase: "failed",
+			reason: busy
+		});
+		if (answer === "publish") {
+			const branch = sw.publish;
+			if (!branch || this.cl.branch() !== branch) return this.say({
+				phase: "failed",
+				reason: "There is no feature branch checked out to commit your edits on."
 			});
-			r = await startUnnamed(this.cl.top, w);
+			if (localChanges(this.cl.top).length) {
+				const r = commitLocal(this.cl.top, this.localSubject(sw.files));
+				if (!r.ok) return this.say({
+					phase: "failed",
+					reason: `Couldn't commit your edits: ${r.error}`
+				});
+				this.sendChanges();
+			}
+			let w = null;
+			try {
+				w = this.wf();
+			} catch {}
+			if (w?.remote) {
+				this.say({
+					phase: "switching",
+					branch: sw.to ?? w.base
+				});
+				try {
+					await pushBranch(this.cl.top, branch, "Publish");
+				} catch (e) {
+					return this.say({
+						phase: "failed",
+						reason: `Couldn't push ${branch}: ${firstLine(e.message)} Your edits are committed on it.`
+					});
+				}
+				this.sendChanges();
+			}
+		}
+		await this.doSwitch(sw.to, true);
+	}
+	/**
+	* The commit subject for the user's own edits: the session's, else their files; in the repository's style. Without
+	* stift's ✏️: they aren't a comment's change (no Stift-Comment trailer either), so the list shows them as not stift's.
+	*/
+	localSubject(files) {
+		let prefix = "";
+		try {
+			const s = this.wf().commitStyle;
+			if (s.conventional) prefix = `${s.type ?? "chore"}: `;
+		} catch {}
+		const subject = this.summarySubject?.replace(/^[a-z]+(\([^)]*\))?!?:\s*/, "") ?? `Edit ${files[0]}${files.length > 1 ? ` and ${files.length - 1} more file${files.length > 2 ? "s" : ""}` : ""}`;
+		return prefix + subject;
+	}
+	/** Switches to `to`, or starts a new, unnamed feature on the base (null). `stash`: when git refuses, stash and pop. */
+	async doSwitch(to, stash) {
+		let r;
+		let branch = to ?? "";
+		try {
+			if (to === null) {
+				const w = this.wf();
+				branch = w.base;
+				this.say({
+					phase: "switching",
+					branch
+				});
+				r = await startUnnamed(this.cl.top, w, { stash });
+			} else {
+				this.say({
+					phase: "switching",
+					branch
+				});
+				r = await switchTo(this.cl.top, to, { stash });
+			}
 		} catch (e) {
 			r = {
 				ok: false,
 				error: firstLine(e.message)
 			};
 		}
-		this.switching = r.ok ? void 0 : {
+		this.switching = !r.ok ? {
 			phase: "failed",
 			reason: r.error
-		};
+		} : r.clash ? {
+			phase: "clashed",
+			branch,
+			reason: r.clash
+		} : void 0;
 		this.watchBranch();
 		this.sendFeatures();
+		this.sendChanges();
 	}
 };
 const firstLine = (s) => short(s.split("\n")[0], 120);
@@ -14984,6 +15591,29 @@ function fixPrompt(p, files, errors) {
 ${pageData(errors.map((e) => `- ${e}`).join("\n"))}
 
 ${RULES(p.id)}`;
+}
+/**
+* The session's brief for an error stift showed on the page (Fix in Claude): what it says, and the state of the
+* checkout. The text is stift's own (git's messages included), not the page's.
+*/
+function errorBrief(title, reason, top) {
+	return `stift showed the user this error in the browser, and they asked you to fix it:
+${title}: ${reason}
+
+The checkout (git status --short --branch):
+\`\`\`
+${git$3([
+		"--no-optional-locks",
+		"status",
+		"--short",
+		"--branch"
+	], {
+		cwd: top,
+		allowFail: true
+	}).out.split("\n").slice(0, 40).join("\n") || "(unknown)"}
+\`\`\`
+
+Find the cause and fix it in this repository: for example resolve conflict markers, pull or rebase the branch, or fix the code. Keep the user's work: don't discard their edits or commits (no reset --hard, checkout -- or clean, no force push), and don't switch branches unless the error is about that. Then tell the user in a sentence or two what you did, or why it needs them, so they can try again in the browser.`;
 }
 function exactEditPrompt(p) {
 	return `The user changed text on the running app to ${JSON.stringify(p.values?.to ?? "")}. Old text ${pageData(JSON.stringify(p.values?.from ?? ""))}
@@ -15089,13 +15719,8 @@ function serve(info, tools) {
 		}
 	});
 }
-// packages/claude-plugin/src/server.ts
-const bridge = new Bridge(process.env.CLAUDE_PROJECT_DIR ?? process.cwd(), { owner: owner() });
-serve({
-	name: "stift",
-	version: STIFT_VERSION,
-	instructions: "stift turns comments from the browser overlay into code changes. After /stift:start (start_listening), stift wakes this session with each comment, one at a time: make the change yourself as its brief says, then end your turn with the ▶ line stift gives you as your only text (no \"Done.\" or summary). Write to the user only the lines stift gives you (▶ / · stift #n …), never idle or \"still listening\" messages. Each comment becomes a commit on the feature branch checked out. For \"undo the last change\" or \"redo it\", call undo or redo (latest change only)."
-}, [
+// packages/claude-plugin/src/tools.ts
+const tools = (bridge) => [
 	{
 		name: "start_listening",
 		description: "Start listening for comments from the stift browser overlay in this session (/stift:start). Afterwards end your turn: stift wakes this session with each comment, one at a time.",
@@ -15167,6 +15792,20 @@ serve({
 		run: async (a) => bridge.reportReview(a)
 	},
 	{
+		name: "report_summary",
+		description: "Finish a stift summary job: the tl;dr of the user's own uncommitted edits (at most 200 words) and a one-line commit subject for them.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				summary: { type: "string" },
+				subject: { type: "string" }
+			},
+			required: ["summary", "subject"],
+			additionalProperties: false
+		},
+		run: async (a) => bridge.reportSummary(a)
+	},
+	{
 		name: "undo",
 		description: "Undo the newest stift change on the feature branch: its commit is dropped (or, once pushed, reverted with a new commit), and its hunks leave the working tree; the user's own edits stay. Latest only: call it again to go one further.",
 		inputSchema: {
@@ -15186,7 +15825,14 @@ serve({
 		},
 		run: async () => bridge.history("redo")
 	}
-]);
+];
+// packages/claude-plugin/src/server.ts
+const bridge = new Bridge(process.env.CLAUDE_PROJECT_DIR ?? process.cwd(), { owner: owner() });
+serve({
+	name: "stift",
+	version: STIFT_VERSION,
+	instructions: "stift turns comments from the browser overlay into code changes. After /stift:start (start_listening), stift wakes this session with each comment, one at a time: make the change yourself as its brief says, then end your turn with the ▶ line stift gives you as your only text (no \"Done.\" or summary). Write to the user only the lines stift gives you (▶ / · stift #n …), never idle or \"still listening\" messages. Each comment becomes a commit on the feature branch checked out. For \"undo the last change\" or \"redo it\", call undo or redo (latest change only)."
+}, tools(bridge));
 bridge.serve().catch((e) => (process.stderr.write(`stift: ${e.message}\n`), bridge.telemetry.error(e, "serve")));
 const exit = () => bridge.stop().then(() => (bridge.telemetry.sessionEnd(), bridge.telemetry.shutdown())).finally(() => process.exit(0));
 process.stdin.on("end", exit);

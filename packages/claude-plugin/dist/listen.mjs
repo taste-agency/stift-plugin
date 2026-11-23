@@ -5,6 +5,16 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 // packages/claude-plugin/src/claude/index.ts
+/**
+* Whether this hook is one `stift start` put in the project's settings for another Claude Code process (its
+* `--claude-pid`): such a hook does nothing, so it can't act for another session or outlive its own.
+*/
+const forOtherProcess = () => {
+	const i = process.argv.indexOf("--claude-pid");
+	return i > 0 && process.argv[i + 1] !== String(process.env.CLAUDE_PID ?? process.ppid);
+};
+/** The file the ConfigChange hook of `stift start` writes in .git/stift once Claude Code applied its hooks (claude/start.ts). */
+const readyFile = (stiftDir, pid) => path.join(stiftDir, `hooks-ready-${pid}`);
 const RELEASED = "stift: another Claude Code session started listening for comments in this repository and took over the browser overlay. Tell the user in one line that this session no longer listens.";
 /**
 * What the session reads when stift wakes it (the Stop hook), or with the user's prompt (`withPrompt`, the
@@ -14,14 +24,26 @@ function wakeText(w, withPrompt = false) {
 	const lines = w.lines.join("\n");
 	if (withPrompt) {
 		const parts = [`stift: while you worked, the browser sent this. Write these lines to the user verbatim first:\n${lines}`];
-		if (w.job?.kind === "review") parts.push(`Then open or update the pull request for the feature branch, now, as the brief below says, and call report_review. Then answer the user's message.\n\n${w.job.brief}`);
+		if (w.job?.kind === "summary") parts.push(`Then summarize the user's own edits, now, as the brief below says, and call report_summary. Then answer the user's message.\n\n${w.job.brief}`);
+		else if (w.job?.kind === "review") parts.push(`Then open or update the pull request for the feature branch, now, as the brief below says, and call report_review. Then answer the user's message.\n\n${w.job.brief}`);
+		else if (w.job?.kind === "error") parts.push(`Then fix the error below, now, as the brief says. Then answer the user's message.\n\n${w.job.brief}`);
 		else if (w.job) parts.push(`Then make ${w.job.kind === "fix" ? "the fix for " : ""}stift #${w.job.n} yourself, now, as the brief below says. Don't start a subagent. Then answer the user's message.\n\n${w.job.brief}`);
 		return parts.join("\n\n");
 	}
+	if (w.job?.kind === "summary") return [
+		`stift: summarize the user's own uncommitted edits, now, as the brief below says. Don't start a subagent, and don't write anything before or while you work.`,
+		w.job.brief,
+		`When report_summary is called, end your turn by writing exactly these lines, verbatim, as your only text:\n${lines}`
+	].join("\n\n");
 	if (w.job?.kind === "review") return [
 		`stift: open or update the pull request for the user's feature branch, now, as the brief below says. Don't start a subagent, and don't write anything before or while you work.`,
 		w.job.brief,
 		`When report_review is called, end your turn by writing exactly these lines, verbatim, as your only text:\n${lines}`
+	].join("\n\n");
+	if (w.job?.kind === "error") return [
+		`stift: the user asked you to fix an error stift showed in the browser, now, as the brief below says. Don't start a subagent.`,
+		w.job.brief,
+		`Start your reply with these lines, verbatim:\n${lines}`
 	].join("\n\n");
 	if (!w.job) return `stift: Write exactly these lines to the user, verbatim, and end your turn with no other text:\n${lines}`;
 	return [
@@ -37,6 +59,7 @@ const LISTEN_MS = Number(process.env.STIFT_LISTEN_SECONDS ?? 86100) * 1e3;
 const HOLD_MS = 24e4;
 const REARM = "stift: still listening for comments. End your turn without writing anything.";
 const STALE = "stift: the stift plugin was updated while this Claude Code session ran, and the session still runs the old version of its bridge. Tell the user in one line: to keep using stift, restart Claude Code in this project (exit, then `claude --continue`) and run /stift:start. Write nothing else.";
+if (forOtherProcess()) process.exit(0);
 const mode = process.argv[2];
 let raw = "";
 for await (const chunk of process.stdin) raw += chunk;
@@ -103,6 +126,11 @@ function stale(a) {
 function wake(text) {
 	process.stderr.write(text);
 	process.exit(2);
+}
+if (mode === "ready") {
+	const b = bridge();
+	if (b) fs.writeFileSync(readyFile(b.dir, who.pid), "");
+	process.exit(0);
 }
 if (mode === "check") {
 	const r = await call("/check", {}, 3e3).catch(() => null);
