@@ -4,6 +4,31 @@ import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+// packages/claude-plugin/src/protocol.ts
+/** The file the bridge advertises itself in, read by the Vite plugin. */
+const bridgeFile = (gitDir) => path.join(gitDir, "stift", "bridge.json");
+function readBridge(gitDir) {
+	try {
+		const b = JSON.parse(fs.readFileSync(bridgeFile(gitDir), "utf8"));
+		return {
+			url: String(b.url).replace(/^ws/, "http"),
+			token: String(b.token),
+			pid: Number(b.pid),
+			dir: path.dirname(bridgeFile(gitDir))
+		};
+	} catch {
+		return null;
+	}
+}
+const postBridge = (b, route, body, timeoutMs) => fetch(b.url + route, {
+	method: "POST",
+	headers: {
+		"content-type": "application/json",
+		"x-stift-token": b.token
+	},
+	body: JSON.stringify(body),
+	signal: AbortSignal.timeout(timeoutMs)
+});
 // packages/claude-plugin/src/claude/index.ts
 /**
 * Whether this hook is one `stift start` put in the project's settings for another Claude Code process (its
@@ -71,7 +96,7 @@ const who = {
 };
 function bridge() {
 	try {
-		const gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
+		return readBridge(execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
 			cwd: input.cwd ?? process.cwd(),
 			encoding: "utf8",
 			stdio: [
@@ -79,14 +104,7 @@ function bridge() {
 				"pipe",
 				"ignore"
 			]
-		}).trim();
-		const b = JSON.parse(fs.readFileSync(path.join(gitDir, "stift", "bridge.json"), "utf8"));
-		return {
-			url: String(b.url).replace(/^ws/, "http"),
-			token: b.token,
-			dir: path.join(gitDir, "stift"),
-			pid: b.pid
-		};
+		}).trim());
 	} catch {
 		return null;
 	}
@@ -95,19 +113,11 @@ function bridge() {
 async function call(route, body, timeoutMs) {
 	const b = bridge();
 	if (!b) return null;
-	const r = await fetch(b.url + route, {
-		method: "POST",
-		headers: {
-			"content-type": "application/json",
-			"x-stift-token": b.token
-		},
-		body: JSON.stringify({
-			...who,
-			...body,
-			protocol: 4
-		}),
-		signal: AbortSignal.timeout(timeoutMs)
-	});
+	const r = await postBridge(b, route, {
+		...who,
+		...body,
+		protocol: 4
+	}, timeoutMs);
 	if (!r.ok) return null;
 	const a = await r.json();
 	return a?.protocol === 4 ? a : {

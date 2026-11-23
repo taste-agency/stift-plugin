@@ -210,7 +210,7 @@ var ChangesError = class extends Error {
 };
 const hash = (s) => crypto.createHash("sha1").update(s).digest("hex").slice(0, 20);
 const same = (a, b) => a && b ? a.blob === b.blob && a.mode === b.mode : a === b;
-function readJson(file) {
+function readJson$1(file) {
 	try {
 		return JSON.parse(fs.readFileSync(file, "utf8"));
 	} catch {
@@ -583,18 +583,40 @@ var Changes = class {
 		} catch {
 			return [];
 		}
-		return names.filter((f) => f.endsWith(".json")).map((f) => readJson(path.join(dir, "files", f))).filter((t) => t !== null);
+		return names.filter((f) => f.endsWith(".json")).map((f) => readJson$1(path.join(dir, "files", f))).filter((t) => t !== null);
 	}
 	/** Running tasks (comments being made) and the files they touched. */
 	activeTasks() {
 		const root = path.join(this.dir, "tasks");
 		return fs.readdirSync(root).flatMap((name) => {
-			const task = readJson(path.join(root, name, "task.json"));
+			const task = readJson$1(path.join(root, name, "task.json"));
 			return task ? [{
 				...task,
 				files: this.touches(path.join(root, name)).map((t) => t.path)
 			}] : [];
 		});
+	}
+	textsBefore(taskId, only) {
+		const out = /* @__PURE__ */ new Map();
+		for (const f of this.pending(taskId)?.files ?? []) out.set(f.path, f.before);
+		const root = path.join(this.dir, "tasks");
+		let names = [];
+		try {
+			names = fs.readdirSync(root);
+		} catch {}
+		for (const name of names) {
+			if (readJson$1(path.join(root, name, "task.json"))?.taskId !== taskId) continue;
+			for (const t of this.touches(path.join(root, name))) if (!out.has(t.path)) out.set(t.path, t.before);
+		}
+		return [...out].filter(([p]) => only === void 0 || p === only).map(([p, s]) => ({
+			path: p,
+			before: s ? this.git([
+				"cat-file",
+				"--filters",
+				`--path=${p}`,
+				s.blob
+			]).stdout.toString("utf8") : null
+		}));
 	}
 	/** Stores a comment's metadata (text, commit message) for `begin`: the hooks only see its id. */
 	registerComment(comment) {
@@ -614,26 +636,26 @@ var Changes = class {
 	}
 	/** The active comment, for a hook of `session`: null when none is active, or another session has it. */
 	active(session) {
-		const a = readJson(path.join(this.dir, "active.json"));
+		const a = readJson$1(path.join(this.dir, "active.json"));
 		if (!a?.id || a.session && session && a.session !== session) return null;
 		return a.id;
 	}
 	/** Whether the active comment is in another session's hands than `session`. */
 	othersActive(session) {
-		const a = readJson(path.join(this.dir, "active.json"));
+		const a = readJson$1(path.join(this.dir, "active.json"));
 		return !!a?.id && !!a.session && !!session && a.session !== session;
 	}
 	/** Links a comment to the agent that makes it. */
 	begin(taskId, agentId, comment) {
 		const dir = this.taskDir(agentId);
 		fs.mkdirSync(path.join(dir, "files"), { recursive: true });
-		const cur = readJson(path.join(dir, "task.json"));
+		const cur = readJson$1(path.join(dir, "task.json"));
 		if (cur?.taskId === taskId) return;
 		if (cur) fs.rmSync(path.join(dir, "files"), {
 			recursive: true,
 			force: true
 		}), fs.mkdirSync(path.join(dir, "files"));
-		const meta = comment ?? readJson(path.join(this.dir, "comments", `${hash(taskId)}.json`)) ?? { id: taskId };
+		const meta = comment ?? readJson$1(path.join(this.dir, "comments", `${hash(taskId)}.json`)) ?? { id: taskId };
 		writeJson(path.join(dir, "task.json"), {
 			taskId,
 			agentId,
@@ -648,7 +670,7 @@ var Changes = class {
 		if (!rel || !fs.existsSync(path.join(dir, "task.json"))) return;
 		const record = path.join(dir, "files", `${hash(rel)}.json`);
 		const pre = this.worktree([rel]).get(rel) ?? null;
-		const cur = readJson(record);
+		const cur = readJson$1(record);
 		writeJson(record, cur ? {
 			...cur,
 			pending: pre
@@ -664,7 +686,7 @@ var Changes = class {
 		const rel = this.relPath(file);
 		if (!rel) return;
 		const record = path.join(this.taskDir(agentId), "files", `${hash(rel)}.json`);
-		const touch = readJson(record);
+		const touch = readJson$1(record);
 		if (touch && "pending" in touch) writeJson(record, this.fold(touch));
 	}
 	fold(touch) {
@@ -681,7 +703,7 @@ var Changes = class {
 		return path.join(this.dir, "pending", `${hash(taskId)}.json`);
 	}
 	pending(taskId) {
-		return readJson(this.pendingFile(taskId));
+		return readJson$1(this.pendingFile(taskId));
 	}
 	/** Files with a pending change (made, not confirmed yet): undo and redo leave them alone. */
 	pendingFiles() {
@@ -689,7 +711,7 @@ var Changes = class {
 		try {
 			names = fs.readdirSync(path.join(this.dir, "pending"));
 		} catch {}
-		return names.flatMap((n) => readJson(path.join(this.dir, "pending", n))?.files.map((f) => f.path) ?? []);
+		return names.flatMap((n) => readJson$1(path.join(this.dir, "pending", n))?.files.map((f) => f.path) ?? []);
 	}
 	/**
 	* Ends the agent's task: its hunks join the comment's pending change (a fix attempt adds to the first attempt's).
@@ -698,7 +720,7 @@ var Changes = class {
 	finishTask(agentId) {
 		const dir = this.taskDir(agentId);
 		return this.locked(() => {
-			const task = readJson(path.join(dir, "task.json"));
+			const task = readJson$1(path.join(dir, "task.json"));
 			if (!task) return null;
 			try {
 				const prev = this.pending(task.taskId);
@@ -835,7 +857,7 @@ var Changes = class {
 		return path.join(this.dir, "undo.json");
 	}
 	stack() {
-		const s = readJson(this.stackFile());
+		const s = readJson$1(this.stackFile());
 		return s && s.branch === this.branch() && s.head === this.head() ? s.stack : [];
 	}
 	clearRedo() {
@@ -1062,6 +1084,7 @@ function decode(s) {
 *   at Home (about://React/Prerender/file:///app/.next/…/chunk.js?102:51:425)                server component
 *   at Hero (about://React/Prerender/file:///app/.next/…/chunk.js?id=%255Bproject%255D/src/hero.tsx+…?98:81:426)
 *   at Page (rsc://React/Server/file:///app/.next/…/chunk.js?7:3:9)
+*   at helper (http://localhost:3000/_next/static/chunks/x.js?id=%255Bproject%255D/src/lib.ts+…:12:11)   a hot-updated module
 */
 function parseFrame(line) {
 	const m = line.match(/^\s*at (?:async )?(?:(.+?) \((.+):(\d+):(\d+)\)|(.+):(\d+):(\d+))\s*$/);
@@ -1073,15 +1096,16 @@ function parseFrame(line) {
 		column: +(m[4] ?? m[7])
 	};
 	loc = loc.replace(/^(about|rsc):\/\/React\/[^/]+\//, "");
+	const q = loc.indexOf("?");
+	const module = (q < 0 ? "" : decode(loc.slice(q + 1))).match(/(?:^|[?&])id=(\[project\]\/[^\s+?&]+)/)?.[1];
 	if (/^https?:\/\//.test(loc)) return {
 		fn,
 		kind: "http",
-		where: loc,
-		...pos
+		where: module ? loc.slice(0, q) : loc,
+		...pos,
+		...module ? { module } : {}
 	};
 	if (!loc.startsWith("file://")) return null;
-	const q = loc.indexOf("?");
-	const module = (q < 0 ? "" : decode(loc.slice(q + 1))).match(/(?:^|[?&])id=(\[project\]\/[^\s+?&]+)/)?.[1];
 	return {
 		fn,
 		kind: "file",
@@ -1113,6 +1137,13 @@ function inside(file, top) {
 	return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 const cache = /* @__PURE__ */ new Map();
+/**
+* How long a map fetched from the dev server counts, by chunk URL. A chunk is served again under the same URL once
+* one of its modules changed (Turbopack's chunk names are stable in dev), so a map kept for good would be the old
+* chunk's. A chunk on disk is checked by its modification time instead.
+*/
+const FETCHED_TTL_MS = 3e3;
+const fetchedAt = /* @__PURE__ */ new Map();
 const isLocal = (u) => [
 	"localhost",
 	"127.0.0.1",
@@ -1123,7 +1154,7 @@ async function text(url) {
 	if (!r.ok) throw new Error(`${r.status} ${url}`);
 	return r.text();
 }
-/** The chunk's source map: inline, a sibling .map file, or fetched. Cached per chunk (and file mtime). */
+/** The chunk's source map: inline, a sibling .map file, or fetched. Cached per chunk (by file mtime, or for a moment). */
 async function loadMap(f, scope) {
 	let key = f.where;
 	if (f.kind === "file") {
@@ -1137,10 +1168,12 @@ async function loadMap(f, scope) {
 		const u = new URL(f.where);
 		if (!isLocal(u) || scope.origin && u.origin !== scope.origin) return null;
 	}
-	if (cache.has(key)) return cache.get(key);
+	const fetched = f.kind === "http";
+	if (cache.has(key) && (!fetched || Date.now() - (fetchedAt.get(key) ?? 0) < FETCHED_TTL_MS)) return cache.get(key);
 	let loaded = null;
 	try {
-		const ref = (f.kind === "file" ? fs.readFileSync(f.where, "utf8") : await text(f.where)).match(/\/\/# sourceMappingURL=(\S+)\s*$/)?.[1];
+		const code = f.kind === "file" ? fs.readFileSync(f.where, "utf8") : await text(f.where);
+		const ref = code.match(/\/\/# sourceMappingURL=(\S+)\s*$/)?.[1];
 		if (ref) {
 			let json;
 			if (ref.startsWith("data:")) {
@@ -1160,11 +1193,15 @@ async function loadMap(f, scope) {
 				key,
 				map: new SourceMap(payload),
 				payload,
-				base: f.where
+				base: f.where,
+				code
 			};
 		}
-	} catch {}
+	} catch {
+		if (fetched) return null;
+	}
 	cache.set(key, loaded);
+	if (fetched) fetchedAt.set(key, Date.now());
 	return loaded;
 }
 /** A map source to a path on disk: `file:///abs`, Turbopack's `[project]/x`, an absolute path, or relative to the chunk. */
@@ -1189,12 +1226,17 @@ async function resolveFrame(f, root, scope = { top: root }) {
 	const loaded = await loadMap(f, scope);
 	if (!loaded) return null;
 	let map = loaded.map;
+	let line = f.line;
 	if (f.module && loaded.payload.sections) {
 		const rel = f.module.replace(/^\[project\]\//, "");
 		const section = loaded.payload.sections.find((s) => s.map?.sources?.some((x) => decode(x).replace(/ \(.*\)$/, "").endsWith(`/${rel}`)));
-		if (section) map = new SourceMap(section.map);
+		if (section) {
+			map = new SourceMap(section.map);
+			if (f.kind === "http") line -= factoryLead(loaded.code, f.module, section.offset.line);
+		}
 	}
-	const e = map.findEntry(f.line - 1, f.column - 1);
+	if (line < 1) return null;
+	const e = map.findEntry(line - 1, f.column - 1);
 	if (!e?.originalSource) return null;
 	const file = sourcePath(e.originalSource, root, loaded.base);
 	if (!file || !inside(file, scope.top) || /[/\\]node_modules[/\\]|[/\\]\.next[/\\]/.test(file)) return null;
@@ -1205,6 +1247,16 @@ async function resolveFrame(f, root, scope = { top: root }) {
 		column: e.originalColumn + 1
 	};
 }
+/**
+* How many lines a module's code has before its section of the chunk starts. Turbopack evaluates a hot-updated module
+* from its factory (`"[project]/src/x.ts [app-client] (ecmascript)", ((__turbopack_context__) => {`, then "use strict"),
+* while the section starts at the module's first own line: the frame counts those lines, the section doesn't.
+*/
+function factoryLead(code, module, sectionLine) {
+	const lines = code.split("\n", sectionLine + 1);
+	for (let i = Math.min(sectionLine, lines.length - 1); i >= Math.max(0, sectionLine - 10); i--) if (lines[i].startsWith(`"${module} `) || lines[i].startsWith(`"${module}"`)) return sectionLine - i;
+	return 0;
+}
 function defines(file, fn) {
 	try {
 		return new RegExp(`(function\\s*\\*?\\s*|(const|let|var|class)\\s+)${fn.replace(/\$/g, "\\$")}\\b`).test(fs.readFileSync(file, "utf8"));
@@ -1212,6 +1264,9 @@ function defines(file, fn) {
 		return false;
 	}
 }
+// packages/claude-plugin/src/protocol.ts
+/** The file the bridge advertises itself in, read by the Vite plugin. */
+const bridgeFile = (gitDir) => path.join(gitDir, "stift", "bridge.json");
 // packages/claude-plugin/src/workflow.ts
 const workflowFile = (gitDir) => path.join(gitDir, "stift", "workflow.json");
 const TEMPLATES = [
@@ -2539,6 +2594,134 @@ function jsonc(text) {
 		else out += c;
 	}
 	return out.replace(/,(\s*[}\]])/g, "$1");
+}
+// packages/claude-plugin/src/edit-lines.ts
+const MAX_CELLS = 4e6;
+function changedLines(a, b) {
+	const x = a.split("\n"), y = b.split("\n");
+	let p = 0;
+	while (p < x.length && p < y.length && x[p] === y[p]) p++;
+	let s = 0;
+	while (s < x.length - p && s < y.length - p && x[x.length - 1 - s] === y[y.length - 1 - s]) s++;
+	const n = x.length - p - s, m = y.length - p - s;
+	const before = [], after = [];
+	const hunk = (i, i2, j, j2) => {
+		before.push([p + i + 1, Math.max(p + i + 1, p + i2)]);
+		after.push([p + j + 1, Math.max(p + j + 1, p + j2)]);
+	};
+	if (!n && !m) return {
+		before,
+		after
+	};
+	if (!n || !m || n * m > MAX_CELLS) return hunk(0, n, 0, m), {
+		before,
+		after
+	};
+	const w = m + 1;
+	const t = new Uint32Array((n + 1) * w);
+	for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) t[i * w + j] = x[p + i] === y[p + j] ? t[(i + 1) * w + j + 1] + 1 : Math.max(t[(i + 1) * w + j], t[i * w + j + 1]);
+	let i = 0, j = 0, i0 = 0, j0 = 0;
+	while (i < n && j < m) if (x[p + i] === y[p + j]) {
+		if (i > i0 || j > j0) hunk(i0, i, j0, j);
+		i0 = ++i;
+		j0 = ++j;
+	} else if (t[(i + 1) * w + j] >= t[i * w + j + 1]) i++;
+	else j++;
+	if (i0 < n || j0 < m) hunk(i0, n, j0, m);
+	return {
+		before,
+		after
+	};
+}
+const stylesheet = (file, text, lines) => /\.(css|scss|sass|less|pcss|postcss)$/.test(file) ? { selectors: selectorsAt(text, lines, /\.(scss|less)$/.test(file)) } : null;
+const DESCRIBERS = [stylesheet];
+function describe(file, text, lines) {
+	const out = {};
+	for (const d of DESCRIBERS) for (const [kind, values] of Object.entries(d(file, text, lines) ?? {})) if (values?.length) out[kind] = [.../* @__PURE__ */ new Set([...out[kind] ?? [], ...values])];
+	return out;
+}
+function selectorsAt(css, ranges, lineComments = false) {
+	const out = /* @__PURE__ */ new Set();
+	const blank = (c) => c.replace(/[^\n]/g, " ");
+	let text = css.replace(/\/\*[\s\S]*?\*\//g, blank);
+	if (lineComments) text = text.replace(/(^|[\s;{}])\/\/[^\n]*/g, (c, lead) => lead + blank(c.slice(lead.length)));
+	const breaks = [];
+	for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) breaks.push(i);
+	const lineAt = (i) => {
+		let lo = 0, hi = breaks.length;
+		while (lo < hi) {
+			const mid = lo + hi >> 1;
+			if (breaks[mid] < i) lo = mid + 1;
+			else hi = mid;
+		}
+		return lo + 1;
+	};
+	const open = [];
+	let start = 0;
+	let quote = "";
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (quote) {
+			if (ch === "\\") i++;
+			else if (ch === quote || ch === "\n") quote = "";
+		} else if (ch === "\"" || ch === "'") quote = ch;
+		else if (ch === ";") start = i + 1;
+		else if (ch === "{") {
+			const raw = text.slice(start, i);
+			const prelude = raw.trim().replace(/\s+/g, " ");
+			const parent = open.findLast((o) => o.sel)?.sel;
+			open.push({
+				sel: !prelude || prelude.startsWith("@") ? null : join(parent ?? void 0, prelude),
+				from: lineAt(start + raw.length - raw.trimStart().length),
+				nested: []
+			});
+			start = i + 1;
+		} else if (ch === "}") {
+			const o = open.pop();
+			start = i + 1;
+			if (!o) continue;
+			const to = lineAt(i);
+			const own = (line) => line >= o.from && line <= to && !o.nested.some(([a, b]) => line >= a && line <= b);
+			if (o.sel && ranges.some(([a, b]) => {
+				for (let l = Math.max(a, o.from); l <= Math.min(b, to); l++) if (own(l)) return true;
+				return false;
+			})) out.add(o.sel);
+			if (o.sel) open.findLast((up) => up.sel)?.nested.push([o.from, to]);
+		}
+	}
+	return [...out];
+}
+function splitList(selector) {
+	const out = [];
+	let depth = 0, from = 0;
+	for (let i = 0; i < selector.length; i++) {
+		const ch = selector[i];
+		if (ch === "(" || ch === "[") depth++;
+		else if (ch === ")" || ch === "]") depth--;
+		else if (ch === "," && depth === 0) out.push(selector.slice(from, i).trim()), from = i + 1;
+	}
+	out.push(selector.slice(from).trim());
+	return out.filter(Boolean);
+}
+function join(parent, prelude) {
+	if (!parent) return prelude;
+	const parents = splitList(parent);
+	return splitList(prelude).flatMap((s) => parents.map((p) => s.includes("&") ? s.replaceAll("&", p) : `${p} ${s}`)).join(", ");
+}
+function touchBetween(file, old, next) {
+	if (old === next) return null;
+	const { before, after } = changedLines(old, next);
+	if (!before.length) return null;
+	return {
+		before: {
+			lines: before,
+			hints: describe(file, old, before)
+		},
+		after: {
+			lines: after,
+			hints: describe(file, next, after)
+		}
+	};
 }
 // packages/claude-plugin/src/ws.ts
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -13655,7 +13838,7 @@ function hostOsResourceAttributes() {
 	return osResourceAttributes(osName, osVersion);
 }
 // node_modules/.pnpm/posthog-node@6.0.3/node_modules/posthog-node/dist/extensions/sentry-integration.mjs
-const NAME = "posthog-node";
+const NAME$1 = "posthog-node";
 function createEventProcessor(_posthog, { organization, projectId, prefix, severityAllowList = ["error"], sendExceptionsToPostHog = true } = {}) {
 	return (event) => {
 		if (!("*" === severityAllowList || severityAllowList.includes(event.level))) return event;
@@ -13704,8 +13887,8 @@ var PostHogSentryIntegration = class {
 		this.POSTHOG_ID_TAG = "posthog_distinct_id";
 	}
 	constructor(_posthog, organization, prefix, severityAllowList, sendExceptionsToPostHog) {
-		this.name = NAME;
-		this.name = NAME;
+		this.name = NAME$1;
+		this.name = NAME$1;
 		this.setupOnce = function(addGlobalEventProcessor, getCurrentHub) {
 			const projectId = getCurrentHub()?.getClient()?.getDsn()?.projectId;
 			addGlobalEventProcessor(createEventProcessor(_posthog, {
@@ -14063,6 +14246,18 @@ async function readTurn(transcript, since) {
 	return t;
 }
 // packages/claude-plugin/src/bridge.ts
+const MAX_TOUCHED = 200;
+function touch(v) {
+	const t = v;
+	if (!t || !Array.isArray(t.lines) || typeof t.hints !== "object" || !t.hints) return;
+	const lines = t.lines.flatMap((r) => Array.isArray(r) && Number.isInteger(r[0]) && Number.isInteger(r[1]) && r[0] > 0 && r[1] >= r[0] ? [[r[0], r[1]]] : []).slice(0, MAX_TOUCHED);
+	const hints = {};
+	for (const [kind, values] of Object.entries(t.hints).slice(0, 20)) if (Array.isArray(values)) hints[kind] = values.filter((x) => typeof x === "string" && x.length <= 500).slice(0, MAX_TOUCHED);
+	return {
+		lines,
+		hints
+	};
+}
 /** Attempts per comment: the first change, plus one fix attempt when the page shows errors. */
 const MAX_ATTEMPTS = 2;
 /** The active id while the session opens or updates a pull request. */
@@ -14071,8 +14266,6 @@ const REVIEW = "review";
 const SUMMARY = "summary";
 /** The active id while the session fixes an error the page showed (Fix in Claude). */
 const FIX_ERROR = "fix-error";
-/** The file the bridge advertises itself in, read by the Vite plugin. */
-const bridgeFile = (gitDir) => path.join(gitDir, "stift", "bridge.json");
 /**
 * The bridge's port for a repository (its top-level directory). It is fixed so the Next.js
 * adapter can point the page at the bridge before any session runs; keep it in sync with
@@ -14284,6 +14477,10 @@ var Bridge = class {
 			this.hookRequest(url.pathname, req, res);
 			return;
 		}
+		if (req.method === "POST" && url.pathname === "/editing" && sameToken(req.headers["x-stift-token"], this.token)) {
+			this.editingRequest(req, res);
+			return;
+		}
 		if (req.method === "POST" && url.pathname === "/tool" && this.opts.tool && sameToken(req.headers["x-stift-token"], this.token)) {
 			this.toolRequest(req, res);
 			return;
@@ -14316,6 +14513,44 @@ var Bridge = class {
 			kind: "wake",
 			wake: a
 		});
+	}
+	async editingRequest(req, res) {
+		let body;
+		try {
+			let text = "";
+			for await (const chunk of req) text += chunk;
+			body = JSON.parse(text);
+		} catch {
+			return res.writeHead(400).end();
+		}
+		res.writeHead(204).end();
+		const { id, file } = body;
+		if (!this.owns(body.session, body.pid) || typeof id !== "string" || typeof file !== "string" || id !== this.activeId || this.comments.get(id)?.phase !== "working") return;
+		const pending = touch(body.pending), written = touch(body.written);
+		if (pending && written) this.send({
+			type: "editing",
+			id,
+			file,
+			pending,
+			written
+		});
+	}
+	sendTouched(id, to) {
+		try {
+			for (const { path: file, before } of this.cl.textsBefore(id)) {
+				let now = "";
+				try {
+					now = fs.readFileSync(path.join(this.cl.top, file), "utf8");
+				} catch {}
+				const written = touchBetween(file, before ?? "", now)?.after;
+				if (written) this.send({
+					type: "editing",
+					id,
+					file,
+					written
+				}, to);
+			}
+		} catch {}
 	}
 	async toolRequest(req, res) {
 		const json = (code, v) => res.writeHead(code, { "content-type": "application/json" }).end(JSON.stringify(v));
@@ -14473,6 +14708,7 @@ var Bridge = class {
 			listening: this.listening,
 			comments
 		}, conn);
+		for (const c of this.comments.values()) if (c.phase === "working" || c.phase === "arriving") this.sendTouched(c.record.payload.id, conn);
 		this.send({
 			type: "review",
 			state: this.reviewState
@@ -14703,6 +14939,7 @@ var Bridge = class {
 			c.record.notes = [`Written by stift in ${ms} ms (${r.searched} files searched).`];
 			c.phase = "arriving";
 			this.setStatus(c, "arriving");
+			this.sendTouched(p.id);
 			this.askVerify(c);
 			this.kick();
 			return true;
@@ -15719,6 +15956,45 @@ function serve(info, tools) {
 		}
 	});
 }
+// packages/claude-plugin/src/claude/auto-update.ts
+const NAME = "stift";
+const configDir = (env = process.env) => env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+const readJson = (file) => {
+	try {
+		return JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch {
+		return;
+	}
+};
+/**
+* Whether the stift marketplace auto-updates: `on` or `off` as the person chose, `unset`, or `none` when there's
+* nothing to ask (no marketplace from GitHub, such as an older install from a local directory).
+*/
+function autoUpdateState(env = process.env) {
+	const entry = readJson(path.join(configDir(env), "settings.json"))?.extraKnownMarketplaces?.[NAME];
+	const known = readJson(path.join(configDir(env), "plugins", "known_marketplaces.json"))?.[NAME];
+	const source = (entry ?? known)?.source?.source;
+	if (!source || source === "directory" || source === "file") return "none";
+	const on = entry?.autoUpdate ?? known?.autoUpdate;
+	return on === void 0 ? "unset" : on ? "on" : "off";
+}
+/** Records the person's answer as `autoUpdate` on the stift entry in the user settings, changing nothing else. */
+function setAutoUpdate(on, env = process.env) {
+	const file = path.join(configDir(env), "settings.json");
+	const settings = fs.existsSync(file) ? readJson(file) : {};
+	if (!settings) throw new Error(`${file} isn't valid JSON: fix it, then try again.`);
+	const source = settings.extraKnownMarketplaces?.[NAME]?.source ?? readJson(path.join(configDir(env), "plugins", "known_marketplaces.json"))?.[NAME]?.source;
+	if (!source) throw new Error("The stift marketplace isn't installed: install it with claude plugin marketplace add taste-agency/stift-plugin.");
+	((settings.extraKnownMarketplaces ??= {})[NAME] ??= { source }).autoUpdate = on;
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n");
+	return on ? "✓ Auto-update is on: Claude Code fetches new stift versions by itself; they load in the next session." : "✓ Auto-update stays off. Turn it on later under /plugin → Marketplaces → stift.";
+}
+/** The question for the session, while the person hasn't answered it; `record` says how to record the answer. */
+function autoUpdateQuestion(record, env = process.env) {
+	if (autoUpdateState(env) !== "unset") return "";
+	return `First, ask the user this one question, with "Yes" as the first, preselected option: "Turn on auto-update for stift? Claude Code would fetch new stift versions by itself in the background; they load in your next session." Options: "Yes, turn it on" and "No". Record the answer with ${record("true")} (or false for No). Ask it only this once.`;
+}
 // packages/claude-plugin/src/tools.ts
 const tools = (bridge) => [
 	{
@@ -15731,8 +16007,20 @@ const tools = (bridge) => [
 		},
 		async run() {
 			if (await bridge.arm()) return "Already listening; listening goes on by itself. End your turn now with no text.";
-			return "Listening for stift comments. Say \"Listening for comments from the browser.\" to the user and end your turn: stift wakes this session with each comment.";
+			const ask = autoUpdateQuestion((on) => `the set_auto_update tool ({"on": ${on}})`);
+			return `Listening for stift comments.${ask && ` ${ask}`} Say "Listening for comments from the browser." to the user and end your turn: stift wakes this session with each comment.`;
 		}
+	},
+	{
+		name: "set_auto_update",
+		description: "Record the user's answer to stift's auto-update question: whether Claude Code updates the stift plugin by itself.",
+		inputSchema: {
+			type: "object",
+			properties: { on: { type: "boolean" } },
+			required: ["on"],
+			additionalProperties: false
+		},
+		run: async (a) => setAutoUpdate(a.on === true)
 	},
 	{
 		name: "stop_listening",

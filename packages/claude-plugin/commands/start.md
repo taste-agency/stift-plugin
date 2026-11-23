@@ -1,9 +1,9 @@
 ---
 description: Listen for comments from the stift browser overlay; this session makes each change, one at a time
-allowed-tools: mcp__plugin_stift_bridge__start_listening, mcp__plugin_stift_bridge__stop_listening, mcp__plugin_stift_bridge__report_comment, mcp__plugin_stift_bridge__report_review, mcp__plugin_stift_bridge__report_summary, mcp__plugin_stift_bridge__undo, mcp__plugin_stift_bridge__redo, Read, Edit, MultiEdit, Write, Bash(git:*), Bash(gh pr create:*), Bash(gh pr edit:*), Bash(glab mr create:*), Bash(glab mr update:*)
+allowed-tools: mcp__plugin_stift_bridge__start_listening, mcp__plugin_stift_bridge__stop_listening, mcp__plugin_stift_bridge__report_comment, mcp__plugin_stift_bridge__report_review, mcp__plugin_stift_bridge__report_summary, mcp__plugin_stift_bridge__set_auto_update, mcp__plugin_stift_bridge__undo, mcp__plugin_stift_bridge__redo, Read, Edit, MultiEdit, Write, Bash(git:*), Bash(gh pr create:*), Bash(gh pr edit:*), Bash(glab mr create:*), Bash(glab mr update:*)
 ---
 
-Start listening for stift comments: call `mcp__plugin_stift_bridge__start_listening`, say "Listening for comments from the browser.", and end your turn. Don't wait or poll: stift wakes this session with each comment (a `stift:` message), and the user can keep working with you in between.
+Start listening for stift comments: call `mcp__plugin_stift_bridge__start_listening` (and ask the one question it may return first), say "Listening for comments from the browser.", and end your turn. Don't wait or poll: stift wakes this session with each comment (a `stift:` message), and the user can keep working with you in between.
 
 When stift wakes you:
 - Write the lines it gives you (`▶ stift #<n> …`, `· stift #<n> queued …`) verbatim, and nothing else. With a comment, write them after the edit, as the turn's last and only text.

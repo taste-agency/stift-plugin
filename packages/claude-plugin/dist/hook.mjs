@@ -585,6 +585,28 @@ var Changes = class {
 			}] : [];
 		});
 	}
+	textsBefore(taskId, only) {
+		const out = /* @__PURE__ */ new Map();
+		for (const f of this.pending(taskId)?.files ?? []) out.set(f.path, f.before);
+		const root = path.join(this.dir, "tasks");
+		let names = [];
+		try {
+			names = fs.readdirSync(root);
+		} catch {}
+		for (const name of names) {
+			if (readJson(path.join(root, name, "task.json"))?.taskId !== taskId) continue;
+			for (const t of this.touches(path.join(root, name))) if (!out.has(t.path)) out.set(t.path, t.before);
+		}
+		return [...out].filter(([p]) => only === void 0 || p === only).map(([p, s]) => ({
+			path: p,
+			before: s ? this.git([
+				"cat-file",
+				"--filters",
+				`--path=${p}`,
+				s.blob
+			]).stdout.toString("utf8") : null
+		}));
+	}
 	/** Stores a comment's metadata (text, commit message) for `begin`: the hooks only see its id. */
 	registerComment(comment) {
 		writeJson(path.join(this.dir, "comments", `${hash(comment.id)}.json`), comment);
@@ -1001,6 +1023,184 @@ var Changes = class {
 		return new Set(this.changes(null).filter((c) => c.undone && c.comment).map((c) => c.comment));
 	}
 };
+// packages/claude-plugin/src/edit-lines.ts
+const MAX_CELLS = 4e6;
+function simulate(tool, input, old) {
+	const one = (text, e) => {
+		if (typeof e.old_string !== "string" || typeof e.new_string !== "string" || !e.old_string) return null;
+		const at = text.indexOf(e.old_string);
+		if (at < 0) {
+			const crlf = (t) => t.replace(/\r?\n/g, "\r\n");
+			return text.includes("\r\n") && crlf(e.old_string) !== e.old_string ? one(text, {
+				...e,
+				old_string: crlf(e.old_string),
+				new_string: crlf(e.new_string)
+			}) : null;
+		}
+		if (e.replace_all === true) return text.split(e.old_string).join(e.new_string);
+		if (text.indexOf(e.old_string, at + 1) >= 0) return null;
+		return text.slice(0, at) + e.new_string + text.slice(at + e.old_string.length);
+	};
+	if (tool === "Write") return typeof input.content === "string" ? input.content : null;
+	if (tool === "Edit") return one(old, input);
+	if (tool === "MultiEdit" && Array.isArray(input.edits)) {
+		let text = old;
+		for (const e of input.edits) if ((text = one(text, e)) === null) return null;
+		return text;
+	}
+	return null;
+}
+function changedLines(a, b) {
+	const x = a.split("\n"), y = b.split("\n");
+	let p = 0;
+	while (p < x.length && p < y.length && x[p] === y[p]) p++;
+	let s = 0;
+	while (s < x.length - p && s < y.length - p && x[x.length - 1 - s] === y[y.length - 1 - s]) s++;
+	const n = x.length - p - s, m = y.length - p - s;
+	const before = [], after = [];
+	const hunk = (i, i2, j, j2) => {
+		before.push([p + i + 1, Math.max(p + i + 1, p + i2)]);
+		after.push([p + j + 1, Math.max(p + j + 1, p + j2)]);
+	};
+	if (!n && !m) return {
+		before,
+		after
+	};
+	if (!n || !m || n * m > MAX_CELLS) return hunk(0, n, 0, m), {
+		before,
+		after
+	};
+	const w = m + 1;
+	const t = new Uint32Array((n + 1) * w);
+	for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) t[i * w + j] = x[p + i] === y[p + j] ? t[(i + 1) * w + j + 1] + 1 : Math.max(t[(i + 1) * w + j], t[i * w + j + 1]);
+	let i = 0, j = 0, i0 = 0, j0 = 0;
+	while (i < n && j < m) if (x[p + i] === y[p + j]) {
+		if (i > i0 || j > j0) hunk(i0, i, j0, j);
+		i0 = ++i;
+		j0 = ++j;
+	} else if (t[(i + 1) * w + j] >= t[i * w + j + 1]) i++;
+	else j++;
+	if (i0 < n || j0 < m) hunk(i0, n, j0, m);
+	return {
+		before,
+		after
+	};
+}
+const stylesheet = (file, text, lines) => /\.(css|scss|sass|less|pcss|postcss)$/.test(file) ? { selectors: selectorsAt(text, lines, /\.(scss|less)$/.test(file)) } : null;
+const DESCRIBERS = [stylesheet];
+function describe(file, text, lines) {
+	const out = {};
+	for (const d of DESCRIBERS) for (const [kind, values] of Object.entries(d(file, text, lines) ?? {})) if (values?.length) out[kind] = [.../* @__PURE__ */ new Set([...out[kind] ?? [], ...values])];
+	return out;
+}
+function selectorsAt(css, ranges, lineComments = false) {
+	const out = /* @__PURE__ */ new Set();
+	const blank = (c) => c.replace(/[^\n]/g, " ");
+	let text = css.replace(/\/\*[\s\S]*?\*\//g, blank);
+	if (lineComments) text = text.replace(/(^|[\s;{}])\/\/[^\n]*/g, (c, lead) => lead + blank(c.slice(lead.length)));
+	const breaks = [];
+	for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) breaks.push(i);
+	const lineAt = (i) => {
+		let lo = 0, hi = breaks.length;
+		while (lo < hi) {
+			const mid = lo + hi >> 1;
+			if (breaks[mid] < i) lo = mid + 1;
+			else hi = mid;
+		}
+		return lo + 1;
+	};
+	const open = [];
+	let start = 0;
+	let quote = "";
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (quote) {
+			if (ch === "\\") i++;
+			else if (ch === quote || ch === "\n") quote = "";
+		} else if (ch === "\"" || ch === "'") quote = ch;
+		else if (ch === ";") start = i + 1;
+		else if (ch === "{") {
+			const raw = text.slice(start, i);
+			const prelude = raw.trim().replace(/\s+/g, " ");
+			const parent = open.findLast((o) => o.sel)?.sel;
+			open.push({
+				sel: !prelude || prelude.startsWith("@") ? null : join(parent ?? void 0, prelude),
+				from: lineAt(start + raw.length - raw.trimStart().length),
+				nested: []
+			});
+			start = i + 1;
+		} else if (ch === "}") {
+			const o = open.pop();
+			start = i + 1;
+			if (!o) continue;
+			const to = lineAt(i);
+			const own = (line) => line >= o.from && line <= to && !o.nested.some(([a, b]) => line >= a && line <= b);
+			if (o.sel && ranges.some(([a, b]) => {
+				for (let l = Math.max(a, o.from); l <= Math.min(b, to); l++) if (own(l)) return true;
+				return false;
+			})) out.add(o.sel);
+			if (o.sel) open.findLast((up) => up.sel)?.nested.push([o.from, to]);
+		}
+	}
+	return [...out];
+}
+function splitList(selector) {
+	const out = [];
+	let depth = 0, from = 0;
+	for (let i = 0; i < selector.length; i++) {
+		const ch = selector[i];
+		if (ch === "(" || ch === "[") depth++;
+		else if (ch === ")" || ch === "]") depth--;
+		else if (ch === "," && depth === 0) out.push(selector.slice(from, i).trim()), from = i + 1;
+	}
+	out.push(selector.slice(from).trim());
+	return out.filter(Boolean);
+}
+function join(parent, prelude) {
+	if (!parent) return prelude;
+	const parents = splitList(parent);
+	return splitList(prelude).flatMap((s) => parents.map((p) => s.includes("&") ? s.replaceAll("&", p) : `${p} ${s}`)).join(", ");
+}
+function touchBetween(file, old, next) {
+	if (old === next) return null;
+	const { before, after } = changedLines(old, next);
+	if (!before.length) return null;
+	return {
+		before: {
+			lines: before,
+			hints: describe(file, old, before)
+		},
+		after: {
+			lines: after,
+			hints: describe(file, next, after)
+		}
+	};
+}
+// packages/claude-plugin/src/protocol.ts
+/** The file the bridge advertises itself in, read by the Vite plugin. */
+const bridgeFile = (gitDir) => path.join(gitDir, "stift", "bridge.json");
+function readBridge(gitDir) {
+	try {
+		const b = JSON.parse(fs.readFileSync(bridgeFile(gitDir), "utf8"));
+		return {
+			url: String(b.url).replace(/^ws/, "http"),
+			token: String(b.token),
+			pid: Number(b.pid),
+			dir: path.dirname(bridgeFile(gitDir))
+		};
+	} catch {
+		return null;
+	}
+}
+const postBridge = (b, route, body, timeoutMs) => fetch(b.url + route, {
+	method: "POST",
+	headers: {
+		"content-type": "application/json",
+		"x-stift-token": b.token
+	},
+	body: JSON.stringify(body),
+	signal: AbortSignal.timeout(timeoutMs)
+});
 // packages/claude-plugin/src/claude/hook-handler.ts
 const EDIT_TOOLS = /* @__PURE__ */ new Set([
 	"Write",
@@ -1009,7 +1209,7 @@ const EDIT_TOOLS = /* @__PURE__ */ new Set([
 	"NotebookEdit"
 ]);
 /** PreToolUse, PostToolUse and PostToolUseFailure for the edit tools of the main agent. */
-function handleHook(input) {
+async function handleHook(input) {
 	const file = input.tool_input?.file_path ?? input.tool_input?.notebook_path;
 	if (input.agent_id || !EDIT_TOOLS.has(input.tool_name ?? "") || typeof file !== "string") return;
 	const ch = new Changes(input.cwd ?? process.cwd());
@@ -1018,10 +1218,39 @@ function handleHook(input) {
 		if (!active) return;
 		ch.begin(active, MAIN_AGENT);
 		ch.recordEdit(MAIN_AGENT, file);
+		await announce(ch, active, input, file);
 	} else if (input.hook_event_name === "PostToolUse" || input.hook_event_name === "PostToolUseFailure") {
 		if (ch.othersActive(input.session_id)) return;
 		ch.finishEdit(MAIN_AGENT, file);
 	}
+}
+const ANNOUNCE_MS = 500;
+async function announce(ch, comment, input, file) {
+	try {
+		const rel = ch.relPath(file);
+		const b = readBridge(ch.gitDir);
+		if (!rel || !b || !fs.existsSync(file)) return;
+		const now = fs.readFileSync(file, "utf8");
+		const next = simulate(input.tool_name, input.tool_input, now);
+		const edit = next === null ? null : touchBetween(rel, now, next);
+		if (!edit) return;
+		const record = ch.textsBefore(comment, rel)[0];
+		const first = record ? record.before ?? "" : now;
+		const touched = {
+			file: rel,
+			pending: edit.before,
+			written: touchBetween(rel, first, next)?.after ?? {
+				lines: [],
+				hints: {}
+			}
+		};
+		await postBridge(b, "/editing", {
+			session: input.session_id,
+			pid: Number(process.env.CLAUDE_PID ?? process.ppid),
+			id: comment,
+			...touched
+		}, ANNOUNCE_MS);
+	} catch {}
 }
 // packages/claude-plugin/src/claude/index.ts
 /**
@@ -1041,10 +1270,11 @@ try {
 	process.exit(0);
 }
 try {
-	handleHook(input);
+	await handleHook(input);
 } catch (e) {
 	if (e instanceof GitError && /not a git repository/i.test(e.stderr)) process.exit(0);
 	process.stderr.write(`stift hook: ${e.message}\n`);
 	process.exit(1);
 }
+process.exit(0);
 export {};

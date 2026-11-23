@@ -27,8 +27,7 @@ Claude Code doesn't update plugins from third-party marketplaces by itself, so d
   ```
 
   Compare the version before and after. If it changed, this conversation still runs the old version: treat `/stift:setup` and `/stift:start` as not available in this conversation, and use the command-line steps in steps 2 and 4, which run the updated files under `STIFT`.
-- **From another GitHub repository** (such as `taste-agency/stift`): replace it with `claude plugin uninstall stift@stift` and `claude plugin marketplace remove stift`, then install it as below.
-- **From a local directory:** it's a development install. Leave it as it is, and use that directory as `STIFT`.
+- **From anywhere else** (another GitHub repository such as `taste-agency/stift`, or a local directory): replace it with `claude plugin uninstall stift@stift` and `claude plugin marketplace remove stift`, then install it as below.
 - **Not there:** install it from its public GitHub marketplace:
 
   ```sh
@@ -36,7 +35,7 @@ Claude Code doesn't update plugins from third-party marketplaces by itself, so d
   claude plugin install stift@stift
   ```
 
-Check with `claude plugin list` that `stift@stift` shows as enabled. Then turn on auto-update for the `stift` marketplace, so later versions arrive by themselves: in the Claude Code user settings (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` when that is set), add `"autoUpdate": true` next to `source` in `extraKnownMarketplaces.stift`, changing nothing else. Skip this for a development install.
+Check with `claude plugin list` that `stift@stift` shows as enabled. Then ask the person this one question, with "Yes" as the first, preselected option: "Turn on auto-update for stift? Claude Code would fetch new stift versions by itself in the background; they load in your next session." Options: "Yes, turn it on" and "No". Record the answer with `node STIFT/packages/claude-plugin/dist/stift.mjs auto-update yes` (or `no`): it sets `autoUpdate` on `extraKnownMarketplaces.stift` in the Claude Code user settings, changing nothing else. Skip the question when that command without `yes` or `no` already says `on` or `off`.
 
 If installing or updating fails or keeps hitting permission or sandbox errors, say in one line what failed and carry on with step 2 if `STIFT` exists: setup works without the plugin, and the person can install it later.
 
