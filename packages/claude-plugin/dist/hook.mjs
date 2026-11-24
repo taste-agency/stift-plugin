@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 // packages/claude-plugin/src/changes/git.ts
 var GitError = class extends Error {
 	args;
@@ -51,6 +51,32 @@ function git(args, opts) {
 		stderr,
 		out: r.stdout.toString().replace(/\n$/, "")
 	};
+}
+/** `git`, without blocking the event loop. */
+function gitAsync(args, opts) {
+	const env = {
+		...baseEnv,
+		...opts.index ? { GIT_INDEX_FILE: opts.index } : {},
+		...opts.env
+	};
+	return new Promise((resolve, reject) => {
+		execFile("git", args, {
+			cwd: opts.cwd,
+			env,
+			encoding: "buffer",
+			maxBuffer: 1 << 30
+		}, (err, stdout, stderr) => {
+			const status = err ? typeof err.code === "number" ? err.code : -1 : 0;
+			if (err && status === -1) return reject(err);
+			if (status !== 0 && !opts.allowFail) return reject(new GitError(args, status, stderr.toString()));
+			resolve({
+				status,
+				stdout,
+				stderr: stderr.toString(),
+				out: stdout.toString().replace(/\n$/, "")
+			});
+		});
+	});
 }
 /** Splits NUL-terminated output (`-z`). */
 function splitZ(buf) {
@@ -181,12 +207,206 @@ function releaseLock(file, owner) {
 	fs.rmSync(file, { force: true });
 	return true;
 }
+// packages/claude-plugin/src/edit-lines.ts
+const MAX_CELLS = 4e6;
+function simulate(tool, input, old) {
+	const one = (text, e) => {
+		if (typeof e.old_string !== "string" || typeof e.new_string !== "string" || !e.old_string) return null;
+		const at = text.indexOf(e.old_string);
+		if (at < 0) {
+			const crlf = (t) => t.replace(/\r?\n/g, "\r\n");
+			return text.includes("\r\n") && crlf(e.old_string) !== e.old_string ? one(text, {
+				...e,
+				old_string: crlf(e.old_string),
+				new_string: crlf(e.new_string)
+			}) : null;
+		}
+		if (e.replace_all === true) return text.split(e.old_string).join(e.new_string);
+		if (text.indexOf(e.old_string, at + 1) >= 0) return null;
+		return text.slice(0, at) + e.new_string + text.slice(at + e.old_string.length);
+	};
+	if (tool === "Write") return typeof input.content === "string" ? input.content : null;
+	if (tool === "Edit") return one(old, input);
+	if (tool === "MultiEdit" && Array.isArray(input.edits)) {
+		let text = old;
+		for (const e of input.edits) if ((text = one(text, e)) === null) return null;
+		return text;
+	}
+	return null;
+}
+function changedLines(a, b) {
+	const before = [], after = [];
+	for (const h of hunks(a, b)) {
+		before.push([h.a + 1, Math.max(h.a + 1, h.a2)]);
+		after.push([h.b + 1, Math.max(h.b + 1, h.b2)]);
+	}
+	return {
+		before,
+		after
+	};
+}
+function hunks(a, b) {
+	const x = a.split("\n"), y = b.split("\n");
+	let p = 0;
+	while (p < x.length && p < y.length && x[p] === y[p]) p++;
+	let s = 0;
+	while (s < x.length - p && s < y.length - p && x[x.length - 1 - s] === y[y.length - 1 - s]) s++;
+	const n = x.length - p - s, m = y.length - p - s;
+	const out = [];
+	const hunk = (i, i2, j, j2) => void out.push({
+		a: p + i,
+		a2: p + i2,
+		b: p + j,
+		b2: p + j2
+	});
+	if (!n && !m) return out;
+	if (!n || !m || n * m > MAX_CELLS) return hunk(0, n, 0, m), out;
+	const w = m + 1;
+	const t = new Uint32Array((n + 1) * w);
+	for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) t[i * w + j] = x[p + i] === y[p + j] ? t[(i + 1) * w + j + 1] + 1 : Math.max(t[(i + 1) * w + j], t[i * w + j + 1]);
+	let i = 0, j = 0, i0 = 0, j0 = 0;
+	while (i < n && j < m) if (x[p + i] === y[p + j]) {
+		if (i > i0 || j > j0) hunk(i0, i, j0, j);
+		i0 = ++i;
+		j0 = ++j;
+	} else if (t[(i + 1) * w + j] >= t[i * w + j + 1]) i++;
+	else j++;
+	if (i0 < n || j0 < m) hunk(i0, n, j0, m);
+	return out;
+}
+/**
+* Where lines `ranges` of `a` are in `b`: shifted past the hunks before them; a line inside a hunk maps to the same
+* line of it when the hunk kept its length (lines rewritten in place), else to all it became (a line deleted since maps
+* to the spot it was at).
+*/
+function mapLines(ranges, a, b) {
+	if (a === b) return ranges;
+	const hs = hunks(a, b);
+	const at = (l) => {
+		let delta = 0;
+		for (const h of hs) {
+			if (l <= h.a) break;
+			if (l <= h.a2) return h.a2 - h.a === h.b2 - h.b ? [h.b + l - h.a, h.b + l - h.a] : [h.b + 1, Math.max(h.b + 1, h.b2)];
+			delta = h.b2 - h.a2;
+		}
+		return [l + delta, l + delta];
+	};
+	return ranges.map(([from, to]) => [at(from)[0], Math.max(at(from)[0], at(to)[1])]);
+}
+const stylesheet = (file, text, lines) => /\.(css|scss|sass|less|pcss|postcss)$/.test(file) ? { selectors: selectorsAt(text, lines, /\.(scss|less)$/.test(file)) } : null;
+const DESCRIBERS = [stylesheet];
+function describe(file, text, lines) {
+	const out = {};
+	for (const d of DESCRIBERS) for (const [kind, values] of Object.entries(d(file, text, lines) ?? {})) if (values?.length) out[kind] = [.../* @__PURE__ */ new Set([...out[kind] ?? [], ...values])];
+	return out;
+}
+function selectorsAt(css, ranges, lineComments = false) {
+	const out = /* @__PURE__ */ new Set();
+	const blank = (c) => c.replace(/[^\n]/g, " ");
+	let text = css.replace(/\/\*[\s\S]*?\*\//g, blank);
+	if (lineComments) text = text.replace(/(^|[\s;{}])\/\/[^\n]*/g, (c, lead) => lead + blank(c.slice(lead.length)));
+	const breaks = [];
+	for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) breaks.push(i);
+	const lineAt = (i) => {
+		let lo = 0, hi = breaks.length;
+		while (lo < hi) {
+			const mid = lo + hi >> 1;
+			if (breaks[mid] < i) lo = mid + 1;
+			else hi = mid;
+		}
+		return lo + 1;
+	};
+	const open = [];
+	let start = 0;
+	let quote = "";
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (quote) {
+			if (ch === "\\") i++;
+			else if (ch === quote || ch === "\n") quote = "";
+		} else if (ch === "\"" || ch === "'") quote = ch;
+		else if (ch === ";") start = i + 1;
+		else if (ch === "{") {
+			const raw = text.slice(start, i);
+			const prelude = raw.trim().replace(/\s+/g, " ");
+			const parent = open.findLast((o) => o.sel)?.sel;
+			open.push({
+				sel: !prelude || prelude.startsWith("@") ? null : join(parent ?? void 0, prelude),
+				from: lineAt(start + raw.length - raw.trimStart().length),
+				nested: []
+			});
+			start = i + 1;
+		} else if (ch === "}") {
+			const o = open.pop();
+			start = i + 1;
+			if (!o) continue;
+			const to = lineAt(i);
+			const own = (line) => line >= o.from && line <= to && !o.nested.some(([a, b]) => line >= a && line <= b);
+			if (o.sel && ranges.some(([a, b]) => {
+				for (let l = Math.max(a, o.from); l <= Math.min(b, to); l++) if (own(l)) return true;
+				return false;
+			})) out.add(o.sel);
+			if (o.sel) open.findLast((up) => up.sel)?.nested.push([o.from, to]);
+		}
+	}
+	return [...out];
+}
+function splitList(selector) {
+	const out = [];
+	let depth = 0, from = 0;
+	for (let i = 0; i < selector.length; i++) {
+		const ch = selector[i];
+		if (ch === "(" || ch === "[") depth++;
+		else if (ch === ")" || ch === "]") depth--;
+		else if (ch === "," && depth === 0) out.push(selector.slice(from, i).trim()), from = i + 1;
+	}
+	out.push(selector.slice(from).trim());
+	return out.filter(Boolean);
+}
+function join(parent, prelude) {
+	if (!parent) return prelude;
+	const parents = splitList(parent);
+	return splitList(prelude).flatMap((s) => parents.map((p) => s.includes("&") ? s.replaceAll("&", p) : `${p} ${s}`)).join(", ");
+}
+/**
+* What a commit changed in `file` (its text before, `old`, and in the commit, `next`), as lines of the file as it is
+* now (`now`, with later edits): for the change marks on the page. Null when the commit didn't change it.
+*/
+function touchSince(file, old, next, now) {
+	if (old === next) return null;
+	const lines = mapLines(changedLines(old, next).after, next, now);
+	return lines.length ? {
+		lines,
+		hints: describe(file, now, lines)
+	} : null;
+}
+function touchBetween(file, old, next) {
+	if (old === next) return null;
+	const { before, after } = changedLines(old, next);
+	if (!before.length) return null;
+	return {
+		before: {
+			lines: before,
+			hints: describe(file, old, before)
+		},
+		after: {
+			lines: after,
+			hints: describe(file, next, after)
+		}
+	};
+}
 // packages/claude-plugin/src/changes/changes.ts
 /** Agent id for the main agent, whose hook input has no agent_id. */
 const MAIN_AGENT = "main";
 /** The trailer that marks a commit as a comment's change. */
 const COMMENT_TRAILER = "Stift-Comment";
 const REVERTS_TRAILER = "Stift-Reverts";
+/** The trailer of a commit that applies an undone change again (its redo). */
+const REAPPLIES_TRAILER = "Stift-Reapplies";
+/** The trailer of an undo or redo made by Cmd+Z (`undo`) or Cmd+Shift+Z (`redo`): it steps the shortcuts' history. */
+const SHORTCUT_TRAILER = "Stift-Shortcut";
+/** The comment id an undo or redo acts on: finds its change when a rebase gave the change's commit another id. */
+const CHANGE_TRAILER = "Stift-Change";
 /** Starts the subject of each comment's commit (":pencil2:"); not undo's reverts, nor Publish's commit of the user's own edits. */
 const COMMIT_PREFIX = "✏️ ";
 var ChangesError = class extends Error {
@@ -223,6 +443,14 @@ var Changes = class Changes {
 	dir;
 	zero;
 	depth = 0;
+	/**
+	* The change list's per-commit work, kept between updates: a clash by (commit, HEAD, undone), a touch by (commit,
+	* undone, the touched files' size and mtime), a blob's text by its id. Commits and trees never change, so only new commits, a moved
+	* HEAD or edited files are computed again.
+	*/
+	memo = /* @__PURE__ */ new Map();
+	/** Clash checks a lazy `changes` left for `fillClashes`: each needs `git merge-file` for these files. */
+	lazyClashes = /* @__PURE__ */ new Map();
 	constructor(cwd) {
 		const [top, gitDir, format] = git([
 			"rev-parse",
@@ -428,10 +656,16 @@ var Changes = class Changes {
 		}
 		return out;
 	}
-	/** 3-way merge of file states: `ours` plus the change from `base` to `theirs`. */
-	merge(ours, base, theirs) {
+	/** A 3-way merge decided without merging texts, or `undefined` when only `git merge-file` can tell. */
+	quickMerge(ours, base, theirs) {
 		if (same(ours, base)) return theirs;
 		if (same(base, theirs) || same(ours, theirs)) return ours;
+		if (!ours || !base || !theirs) return "conflict";
+	}
+	/** 3-way merge of file states: `ours` plus the change from `base` to `theirs`. */
+	merge(ours, base, theirs) {
+		const quick = this.quickMerge(ours, base, theirs);
+		if (quick !== void 0) return quick;
 		if (!ours || !base || !theirs) return "conflict";
 		const r = this.git([
 			"merge-file",
@@ -802,10 +1036,8 @@ var Changes = class Changes {
 					kept
 				};
 				const message = `${COMMIT_PREFIX}${p.comment.message ?? `stift: ${p.comment.text ?? taskId}`}\n\n${COMMENT_TRAILER}: ${taskId}`;
-				const commit = this.move(new Map(go.map((f) => [f.path, f.before])), new Map(go.map((f) => [f.path, f.result])), { message }, { worktree: false });
-				this.clearRedo();
 				return {
-					commit,
+					commit: this.move(new Map(go.map((f) => [f.path, f.before])), new Map(go.map((f) => [f.path, f.result])), { message }, { worktree: false }),
 					files: go.map((f) => f.path),
 					kept
 				};
@@ -833,29 +1065,108 @@ var Changes = class Changes {
 		});
 	}
 	/**
-	* stift's commits on HEAD, newest first: comment commits not reverted since. With `base` (a ref such as
-	* refs/remotes/origin/main), only those over it, as the change list shows them; nothing under it is undone.
+	* The branch's changes, newest first, from its commits alone (over `base`, a ref such as refs/remotes/origin/main,
+	* as the change list shows them; else the newest 100 on HEAD). A commit with a `Stift-Comment` is a change; one with
+	* `Stift-Reverts` undoes it and one with `Stift-Reapplies` applies it again, and its last event says whether it's in.
+	* An older redo copied its change's message: a later commit with a `Stift-Comment` already seen counts as a redo.
+	* With a base, the branch's other commits (not merges) are listed too, as `other`.
+	*
+	* The shortcuts follow one linear history of the user's actions, replayed from the same commits: a new change, or a
+	* row's undo or redo, is an action (it clears what Cmd+Shift+Z redoes); a `Stift-Shortcut: undo` commit reverses
+	* the newest action, and `redo` does again what the last one reversed. `undo` and `redo`: what Cmd+Z and
+	* Cmd+Shift+Z do next.
 	*/
-	undoable(base) {
-		const out = [];
-		const reverted = /* @__PURE__ */ new Set();
-		const log = this.git([
+	history(base) {
+		const range = this.range(base, 100);
+		const onBase = range.length === 1;
+		const recs = this.git([
+			"-c",
+			"core.quotePath=false",
 			"log",
-			"--format=%H%x1f%B%x1e",
-			...this.range(base, 300)
-		], { allowFail: true }).out;
-		for (const rec of log.split("")) {
-			const [sha, body] = rec.trim().split("");
-			if (!sha || !body) continue;
-			const t = trailers(body);
-			if (t.has(REVERTS_TRAILER)) reverted.add(t.get(REVERTS_TRAILER));
-			else if (t.has("Stift-Comment") && !reverted.has(sha)) out.push({
+			"--no-renames",
+			"--format=%x01%H%x1f%P%x1f%B%x1f",
+			"--name-only",
+			...range
+		], { allowFail: true }).out.split("").flatMap((rec) => {
+			const [sha, parents, body, names] = rec.split("");
+			return sha && body ? [{
 				sha,
-				subject: body.split("\n")[0],
-				comment: t.get(COMMENT_TRAILER)
+				parents,
+				body,
+				files: (names ?? "").split("\n").filter(Boolean)
+			}] : [];
+		});
+		const entries = [], toggles = [];
+		const byComment = /* @__PURE__ */ new Map(), bySha = /* @__PURE__ */ new Map();
+		const done = [], undone = [];
+		for (let at = recs.length - 1; at >= 0; at--) {
+			const { sha, parents, body, files } = recs[at];
+			const t = trailers(body);
+			const subject = body.split("\n")[0];
+			const target = t.get(REVERTS_TRAILER) ?? t.get(REAPPLIES_TRAILER);
+			let tg = target ? bySha.get(target) ?? byComment.get(t.get(CHANGE_TRAILER) ?? "") : t.has("Stift-Comment") ? byComment.get(t.get(COMMENT_TRAILER)) : void 0;
+			if (!tg && !target && t.has("Stift-Comment")) {
+				tg = {
+					entry: {
+						sha,
+						subject,
+						comment: t.get(COMMENT_TRAILER),
+						files,
+						undone: false
+					},
+					events: []
+				};
+				byComment.set(tg.entry.comment, tg);
+				toggles.push(tg);
+				entries.push(tg.entry);
+			}
+			if (!tg) {
+				if (!target && onBase && !parents.includes(" ")) entries.push({
+					sha,
+					subject,
+					comment: "",
+					files,
+					undone: false,
+					other: true
+				});
+				continue;
+			}
+			const on = !t.has(REVERTS_TRAILER);
+			const sc = t.get(SHORTCUT_TRAILER);
+			const shortcut = sc === "undo" || sc === "redo" ? sc : void 0;
+			bySha.set(sha, tg);
+			tg.events.push({
+				sha,
+				on,
+				...shortcut ? { shortcut } : {}
 			});
+			const top = shortcut === "undo" ? done.at(-1) : shortcut === "redo" ? undone.at(-1) : void 0;
+			if (shortcut === "undo" && top?.tg === tg && top.on !== on) undone.push(done.pop());
+			else if (shortcut === "redo" && top?.tg === tg && top.on === on) done.push(undone.pop());
+			else done.push({
+				tg,
+				on
+			}), undone.length = 0;
 		}
-		return out;
+		for (const tg of toggles) tg.entry.undone = !tg.events.at(-1).on;
+		const u = done.at(-1), r = undone.at(-1);
+		return {
+			entries: entries.reverse(),
+			toggles,
+			undo: u && u.tg.entry.undone === !u.on ? {
+				tg: u.tg,
+				on: !u.on
+			} : void 0,
+			redo: r && r.tg.entry.undone === r.on ? {
+				tg: r.tg,
+				on: r.on
+			} : void 0
+		};
+	}
+	/** The change `sha` names: its commit, or one of its undos or redos (7 characters or more). */
+	toggleOf(h, sha) {
+		const is = (s) => s === sha || sha.length >= 7 && s.startsWith(sha);
+		return h.toggles.find((tg) => tg.events.some((e) => is(e.sha)));
 	}
 	/** The files a commit changed against its parent. */
 	filesOf(sha) {
@@ -873,16 +1184,6 @@ var Changes = class Changes {
 	busy(paths) {
 		const held = [...this.activeTasks().flatMap((t) => t.files), ...this.pendingFiles()].filter((f) => paths.includes(f));
 		if (held.length) throw new ChangesError("BUSY", `The change in progress is editing ${[...new Set(held)].join(", ")}.`);
-	}
-	stackFile() {
-		return path.join(this.dir, "undo.json");
-	}
-	stack() {
-		const s = readJson(this.stackFile());
-		return s && s.branch === this.branch() && s.head === this.head() ? s.stack : [];
-	}
-	clearRedo() {
-		fs.rmSync(this.stackFile(), { force: true });
 	}
 	/** The commits `git log` reads: those over `base` when it exists, else the newest `max` on HEAD. */
 	range(base, max) {
@@ -903,311 +1204,234 @@ var Changes = class Changes {
 			undo: false,
 			redo: false
 		};
+		const h = this.history(base);
 		return {
-			undo: this.undoable(base).length > 0,
-			redo: this.stack().length > 0
+			undo: !!h.undo,
+			redo: !!h.redo
 		};
 	}
 	/**
-	* Undoes the newest stift commit on the branch (over `base`, when given): drops it while it is HEAD and not pushed,
-	* else adds a commit that reverts it. Its hunks leave the working tree (3-way, so the user's edits stay). Returns what
-	* was undone.
+	* A row's undo or redo of change `sha` (an action of its own), or without `sha` Cmd+Z's or Cmd+Shift+Z's step through
+	* the history (`history`), over `base` when given. Adds a commit that reverts the change or applies it again; its
+	* hunks follow in the working tree (3-way, so the user's edits stay). Cmd+Shift+Z straight after Cmd+Z, or the other
+	* way round, drops that commit instead while it is HEAD and unpushed: the same tree, and the same history as before
+	* it. A change's own commit and a pushed commit are never dropped. Where later commits or the user's edits changed
+	* the same lines, it refuses and changes nothing. Returns the change, and whether it is now in.
 	*/
-	undo(base) {
+	toggle(verb, base, sha) {
 		return this.locked(() => {
 			const why = this.blocked();
 			if (why) throw new ChangesError("NO_BRANCH", why);
-			const target = this.undoable(base)[0];
-			if (!target) throw new ChangesError("NOT_FOUND", "Nothing to undo.");
-			const paths = this.filesOf(target.sha);
+			const h = this.history(base);
+			let act;
+			if (sha) {
+				const tg = this.toggleOf(h, sha);
+				if (!tg) throw new ChangesError("NOT_FOUND", "That change isn't one of stift's on this branch.");
+				if (tg.entry.undone !== (verb === "redo")) throw new ChangesError("NOT_FOUND", verb === "redo" ? "That change isn't undone." : "That change is undone already.");
+				act = {
+					tg,
+					on: verb === "redo"
+				};
+			} else act = verb === "undo" ? h.undo : h.redo;
+			if (!act) throw new ChangesError("NOT_FOUND", verb === "undo" ? "Nothing to undo." : "Nothing to redo.");
+			const { tg, on } = act;
+			const { sha: change, subject, comment } = tg.entry;
+			const paths = this.filesOf(change);
 			this.busy(paths);
-			const before = this.stack();
-			const after = this.inTree(target.sha, paths);
-			const parent = this.inTree(`${target.sha}^`, paths);
+			const after = this.inTree(change, paths);
+			const parent = this.inTree(`${change}^`, paths);
+			const [a, b] = on ? [parent, after] : [after, parent];
 			const head = this.head();
-			let mode;
-			let revert;
-			if (target.sha === head && !this.pushed(head)) {
-				this.move(after, parent, { commit: this.git(["rev-parse", `${head}^`]).out });
-				mode = "dropped";
-			} else {
-				revert = this.move(after, parent, { message: `Revert "${target.subject}"\n\n${REVERTS_TRAILER}: ${target.sha}` });
-				mode = "reverted";
-			}
-			writeJson(this.stackFile(), {
-				branch: this.branch(),
-				head: this.head(),
-				stack: [...before, {
-					sha: target.sha,
-					mode,
-					...revert ? { revert } : {}
-				}]
-			});
+			const last = tg.events.at(-1);
+			if (!sha && last.sha === head && last.shortcut && last.shortcut !== verb && !this.pushed(head)) this.move(a, b, { commit: this.git(["rev-parse", `${head}^`]).out });
+			else this.move(a, b, { message: `${on ? "Reapply" : "Revert"} "${subject}"\n\n${on ? REAPPLIES_TRAILER : REVERTS_TRAILER}: ${change}\n${CHANGE_TRAILER}: ${comment}${sha ? "" : `\n${SHORTCUT_TRAILER}: ${verb}`}` });
 			return {
-				...target,
+				sha: change,
+				subject,
+				comment,
+				on
+			};
+		});
+	}
+	/** A row's undo of change `sha`, else Cmd+Z (`toggle`). */
+	undo(base, sha) {
+		return this.toggle("undo", base, sha);
+	}
+	/** A row's redo of undone change `sha`, else Cmd+Shift+Z (`toggle`). */
+	redo(sha, base) {
+		return this.toggle("redo", base, sha);
+	}
+	cached(key, fn) {
+		if (this.memo.has(key)) return this.memo.get(key);
+		const v = fn();
+		this.memo.set(key, v);
+		return v;
+	}
+	/** Each commit's files, before it and in it (one `diff-tree` for all of them). */
+	commitFiles(shas) {
+		const out = new Map(shas.map((s) => [s, []]));
+		if (!shas.length) return out;
+		const parts = splitZ(this.git([
+			"diff-tree",
+			"--stdin",
+			"-z",
+			"-r",
+			"--root",
+			"--no-renames",
+			"--no-abbrev"
+		], { input: shas.join("\n") + "\n" }).stdout);
+		let cur;
+		for (let i = 0; i < parts.length; i++) {
+			const p = parts[i];
+			if (!p.startsWith(":")) {
+				cur = out.get(p.trim());
+				continue;
+			}
+			const [m1, m2, b1, b2] = p.slice(1).split(" ");
+			const rel = parts[++i];
+			const st = (mode, blob) => /^0+$/.test(mode) ? null : {
+				blob,
 				mode
 			};
-		});
-	}
-	/**
-	* Redoes the last undo, while nothing else moved the branch since: a dropped commit comes back (fast-forward), an
-	* unpushed revert is dropped, otherwise the change is applied again as a new commit.
-	*/
-	redo() {
-		return this.locked(() => {
-			const why = this.blocked();
-			if (why) throw new ChangesError("NO_BRANCH", why);
-			const stack = this.stack();
-			const top = stack.at(-1);
-			if (!top) throw new ChangesError("NOT_FOUND", "Nothing to redo.");
-			const paths = this.filesOf(top.sha);
-			this.busy(paths);
-			const after = this.inTree(top.sha, paths);
-			const parent = this.inTree(`${top.sha}^`, paths);
-			const head = this.head();
-			const body = this.git([
-				"log",
-				"-1",
-				"--format=%B",
-				top.sha
-			]).out;
-			if (top.mode === "dropped" && this.git(["rev-parse", `${top.sha}^`]).out === head) this.move(parent, after, { commit: top.sha });
-			else if (top.mode === "reverted" && top.revert === head && !this.pushed(head)) this.move(parent, after, { commit: this.git(["rev-parse", `${head}^`]).out });
-			else this.move(parent, after, { message: body });
-			writeJson(this.stackFile(), {
-				branch: this.branch(),
-				head: this.head(),
-				stack: stack.slice(0, -1)
-			});
-			return {
-				sha: top.sha,
-				subject: body.split("\n")[0],
-				comment: trailers(body).get("Stift-Comment") ?? ""
-			};
-		});
-	}
-	/**
-	* The branch's commits over `base` (a ref such as refs/remotes/origin/main), newest first: stift's comment commits,
-	* reverts of them, and the commits undone by dropping them (from the undo stack, while the branch is where it left).
-	* With a base, the branch's other commits (not merges) are listed too, as `other`; without one only stift's, as the
-	* branch can't be told apart from the history under it.
-	*/
-	changes(base) {
-		const range = this.range(base, 100);
-		const onBase = range.length === 1;
-		const out = [];
-		const reverted = /* @__PURE__ */ new Set();
-		const log = this.git([
-			"log",
-			"--format=%x01%H%x1f%P%x1f%B%x1f",
-			"--name-only",
-			...range
-		], { allowFail: true }).out;
-		for (const rec of log.split("")) {
-			const [sha, parents, body, names] = rec.split("");
-			if (!sha || !body) continue;
-			const t = trailers(body);
-			const files = (names ?? "").split("\n").filter(Boolean);
-			if (t.has(REVERTS_TRAILER)) {
-				reverted.add(t.get(REVERTS_TRAILER));
-				out.push({
-					sha,
-					subject: body.split("\n")[0],
-					comment: "",
-					files,
-					undone: false,
-					revert: true
-				});
-			} else if (t.has("Stift-Comment")) out.push({
-				sha,
-				subject: body.split("\n")[0],
-				comment: t.get(COMMENT_TRAILER),
-				files,
-				undone: reverted.has(sha)
-			});
-			else if (onBase && !parents.includes(" ")) out.push({
-				sha,
-				subject: body.split("\n")[0],
-				comment: "",
-				files,
-				undone: false,
-				other: true
+			cur?.push({
+				path: rel,
+				before: st(m1, b1),
+				result: st(m2, b2)
 			});
 		}
-		return [...this.stack().filter((u) => u.mode === "dropped").reverse().map((u) => {
-			const body = this.git([
-				"log",
-				"-1",
-				"--format=%B",
-				u.sha
-			], { allowFail: true }).out;
-			return {
-				sha: u.sha,
-				subject: body.split("\n")[0],
-				comment: trailers(body).get("Stift-Comment") ?? "",
-				files: this.filesOf(u.sha),
-				undone: true
-			};
-		}), ...out];
+		return out;
 	}
-	/** Comment ids whose commit is undone on the branch checked out (for the marks on the page). */
-	undone() {
-		return new Set(this.changes(null).filter((c) => c.undone && c.comment).map((c) => c.comment));
+	/** The texts of these blobs, smudged for their paths as checkout writes them (one `cat-file --batch`). */
+	texts(blobs) {
+		const out = /* @__PURE__ */ new Map();
+		const want = [...new Map(blobs.filter((b) => !this.memo.has(`b:${b.blob}`)).map((b) => [b.blob, b])).values()];
+		if (want.length) {
+			const buf = this.git([
+				"cat-file",
+				"--batch",
+				"--filters"
+			], { input: want.map((b) => `${b.blob} ${b.path}`).join("\n") + "\n" }).stdout;
+			let at = 0;
+			for (const b of want) {
+				const nl = buf.indexOf(10, at);
+				const size = Number(buf.subarray(at, nl).toString().split(" ")[2]);
+				this.cached(`b:${b.blob}`, () => buf.subarray(nl + 1, nl + 1 + size).toString("utf8"));
+				at = nl + 1 + size + 1;
+			}
+		}
+		for (const b of blobs) out.set(b.blob, this.memo.get(`b:${b.blob}`));
+		return out;
+	}
+	/**
+	* For each entry still in or undone, whether undoing it (or, undone, redoing it) clashes with HEAD, and what it
+	* changed, as lines of the working tree's files now (what the page renders; for an undone one, where its undo left
+	* them). Memoised (`memo`); what isn't is read in three git calls for all entries together.
+	*/
+	annotate(entries, head, lazy) {
+		const stamp = (rel) => {
+			try {
+				const st = fs.statSync(path.join(this.top, rel));
+				return `${st.size}.${st.mtimeMs}`;
+			} catch {
+				return "-";
+			}
+		};
+		if (this.memo.size > 5e3) this.memo.clear();
+		const clashKey = (e) => `c:${e.sha}:${head}:${e.undone}`;
+		const touchKey = (e) => `t:${e.sha}:${e.undone}:${e.files.map(stamp).join(",")}`;
+		const todo = entries.filter((e) => !this.memo.has(clashKey(e)) || !this.memo.has(touchKey(e)));
+		const files = this.commitFiles([...new Set(todo.map((e) => e.sha))]);
+		const now = this.inTree(head, [...new Set([...files.values()].flat().map((f) => f.path))]);
+		const blobs = [...files.values()].flat().flatMap((f) => [f.before, f.result].flatMap((s) => s ? [{
+			blob: s.blob,
+			path: f.path
+		}] : []));
+		const text = this.texts(blobs);
+		for (const e of entries) {
+			const fc = files.get(e.sha) ?? [];
+			e.touches = this.cached(touchKey(e), () => fc.flatMap((f) => {
+				let cur;
+				try {
+					cur = fs.readFileSync(path.join(this.top, f.path), "utf8");
+				} catch {
+					return [];
+				}
+				if (cur.includes("\0")) return [];
+				const a = f.before ? text.get(f.before.blob) : "", b = f.result ? text.get(f.result.blob) : "";
+				const touch = e.undone ? touchSince(f.path, b, a, cur) : touchSince(f.path, a, b, cur);
+				return touch ? [{
+					file: f.path,
+					...touch
+				}] : [];
+			}));
+			const checks = !e.undone && e.sha === head ? [] : fc.map((f) => {
+				const [from, to] = e.undone ? [f.before, f.result] : [f.result, f.before];
+				return {
+					path: f.path,
+					ours: now.get(f.path) ?? null,
+					base: from,
+					theirs: to
+				};
+			});
+			if (lazy && !this.memo.has(clashKey(e)) && checks.some((c) => this.quickMerge(c.ours, c.base, c.theirs) === void 0)) {
+				this.lazyClashes.set(clashKey(e), checks);
+				continue;
+			}
+			const clash = this.cached(clashKey(e), () => checks.filter((c) => this.merge(c.ours, c.base, c.theirs) === "conflict").map((c) => c.path));
+			if (clash.length) e.conflict = `Later changes edited the same lines in ${clash.join(", ")}.`;
+		}
+	}
+	/**
+	* The change list (`history`), newest first, with each change's clash (`conflict`: why undoing it, or redoing it,
+	* clashes with later commits, so it is refused) and touches. `lazy`: clashes only `git merge-file` decides are left
+	* to `fillClashes`.
+	*/
+	changes(base, o = {}) {
+		const h = this.history(base);
+		if (h.undo && !h.undo.on) h.undo.tg.entry.undoNext = true;
+		if (h.redo?.on) h.redo.tg.entry.redoNext = true;
+		const head = this.head();
+		this.lazyClashes.clear();
+		if (head) this.annotate(h.toggles.map((tg) => tg.entry), head, !!o.lazy);
+		return h.entries;
+	}
+	/**
+	* Runs the clash checks the last lazy `changes` left out, with `git merge-file` in child processes (the event loop
+	* stays free), and keeps their answers. True when there were any: a `changes` now has them all.
+	*/
+	async fillClashes() {
+		const todo = [...this.lazyClashes];
+		this.lazyClashes.clear();
+		await Promise.all(todo.map(async ([key, checks]) => {
+			const clash = [];
+			for (const c of checks) {
+				const quick = this.quickMerge(c.ours, c.base, c.theirs);
+				if (quick === "conflict") clash.push(c.path);
+				else if (quick === void 0) {
+					if ((await gitAsync([
+						"merge-file",
+						"--object-id",
+						c.ours.blob,
+						c.base.blob,
+						c.theirs.blob
+					], {
+						cwd: this.top,
+						allowFail: true
+					})).status !== 0) clash.push(c.path);
+				}
+			}
+			this.memo.set(key, clash);
+		}));
+		return todo.length > 0;
+	}
+	/**
+	* Comment ids whose change is undone on the branch checked out (over `base`, as the change list), for the marks on the page. Reads only the log, not
+	* the change list's per-commit work.
+	*/
+	undone(base) {
+		return new Set(this.history(base).toggles.filter((tg) => tg.entry.undone).map((tg) => tg.entry.comment));
 	}
 };
-// packages/claude-plugin/src/edit-lines.ts
-const MAX_CELLS = 4e6;
-function simulate(tool, input, old) {
-	const one = (text, e) => {
-		if (typeof e.old_string !== "string" || typeof e.new_string !== "string" || !e.old_string) return null;
-		const at = text.indexOf(e.old_string);
-		if (at < 0) {
-			const crlf = (t) => t.replace(/\r?\n/g, "\r\n");
-			return text.includes("\r\n") && crlf(e.old_string) !== e.old_string ? one(text, {
-				...e,
-				old_string: crlf(e.old_string),
-				new_string: crlf(e.new_string)
-			}) : null;
-		}
-		if (e.replace_all === true) return text.split(e.old_string).join(e.new_string);
-		if (text.indexOf(e.old_string, at + 1) >= 0) return null;
-		return text.slice(0, at) + e.new_string + text.slice(at + e.old_string.length);
-	};
-	if (tool === "Write") return typeof input.content === "string" ? input.content : null;
-	if (tool === "Edit") return one(old, input);
-	if (tool === "MultiEdit" && Array.isArray(input.edits)) {
-		let text = old;
-		for (const e of input.edits) if ((text = one(text, e)) === null) return null;
-		return text;
-	}
-	return null;
-}
-function changedLines(a, b) {
-	const x = a.split("\n"), y = b.split("\n");
-	let p = 0;
-	while (p < x.length && p < y.length && x[p] === y[p]) p++;
-	let s = 0;
-	while (s < x.length - p && s < y.length - p && x[x.length - 1 - s] === y[y.length - 1 - s]) s++;
-	const n = x.length - p - s, m = y.length - p - s;
-	const before = [], after = [];
-	const hunk = (i, i2, j, j2) => {
-		before.push([p + i + 1, Math.max(p + i + 1, p + i2)]);
-		after.push([p + j + 1, Math.max(p + j + 1, p + j2)]);
-	};
-	if (!n && !m) return {
-		before,
-		after
-	};
-	if (!n || !m || n * m > MAX_CELLS) return hunk(0, n, 0, m), {
-		before,
-		after
-	};
-	const w = m + 1;
-	const t = new Uint32Array((n + 1) * w);
-	for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) t[i * w + j] = x[p + i] === y[p + j] ? t[(i + 1) * w + j + 1] + 1 : Math.max(t[(i + 1) * w + j], t[i * w + j + 1]);
-	let i = 0, j = 0, i0 = 0, j0 = 0;
-	while (i < n && j < m) if (x[p + i] === y[p + j]) {
-		if (i > i0 || j > j0) hunk(i0, i, j0, j);
-		i0 = ++i;
-		j0 = ++j;
-	} else if (t[(i + 1) * w + j] >= t[i * w + j + 1]) i++;
-	else j++;
-	if (i0 < n || j0 < m) hunk(i0, n, j0, m);
-	return {
-		before,
-		after
-	};
-}
-const stylesheet = (file, text, lines) => /\.(css|scss|sass|less|pcss|postcss)$/.test(file) ? { selectors: selectorsAt(text, lines, /\.(scss|less)$/.test(file)) } : null;
-const DESCRIBERS = [stylesheet];
-function describe(file, text, lines) {
-	const out = {};
-	for (const d of DESCRIBERS) for (const [kind, values] of Object.entries(d(file, text, lines) ?? {})) if (values?.length) out[kind] = [.../* @__PURE__ */ new Set([...out[kind] ?? [], ...values])];
-	return out;
-}
-function selectorsAt(css, ranges, lineComments = false) {
-	const out = /* @__PURE__ */ new Set();
-	const blank = (c) => c.replace(/[^\n]/g, " ");
-	let text = css.replace(/\/\*[\s\S]*?\*\//g, blank);
-	if (lineComments) text = text.replace(/(^|[\s;{}])\/\/[^\n]*/g, (c, lead) => lead + blank(c.slice(lead.length)));
-	const breaks = [];
-	for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) breaks.push(i);
-	const lineAt = (i) => {
-		let lo = 0, hi = breaks.length;
-		while (lo < hi) {
-			const mid = lo + hi >> 1;
-			if (breaks[mid] < i) lo = mid + 1;
-			else hi = mid;
-		}
-		return lo + 1;
-	};
-	const open = [];
-	let start = 0;
-	let quote = "";
-	for (let i = 0; i < text.length; i++) {
-		const ch = text[i];
-		if (quote) {
-			if (ch === "\\") i++;
-			else if (ch === quote || ch === "\n") quote = "";
-		} else if (ch === "\"" || ch === "'") quote = ch;
-		else if (ch === ";") start = i + 1;
-		else if (ch === "{") {
-			const raw = text.slice(start, i);
-			const prelude = raw.trim().replace(/\s+/g, " ");
-			const parent = open.findLast((o) => o.sel)?.sel;
-			open.push({
-				sel: !prelude || prelude.startsWith("@") ? null : join(parent ?? void 0, prelude),
-				from: lineAt(start + raw.length - raw.trimStart().length),
-				nested: []
-			});
-			start = i + 1;
-		} else if (ch === "}") {
-			const o = open.pop();
-			start = i + 1;
-			if (!o) continue;
-			const to = lineAt(i);
-			const own = (line) => line >= o.from && line <= to && !o.nested.some(([a, b]) => line >= a && line <= b);
-			if (o.sel && ranges.some(([a, b]) => {
-				for (let l = Math.max(a, o.from); l <= Math.min(b, to); l++) if (own(l)) return true;
-				return false;
-			})) out.add(o.sel);
-			if (o.sel) open.findLast((up) => up.sel)?.nested.push([o.from, to]);
-		}
-	}
-	return [...out];
-}
-function splitList(selector) {
-	const out = [];
-	let depth = 0, from = 0;
-	for (let i = 0; i < selector.length; i++) {
-		const ch = selector[i];
-		if (ch === "(" || ch === "[") depth++;
-		else if (ch === ")" || ch === "]") depth--;
-		else if (ch === "," && depth === 0) out.push(selector.slice(from, i).trim()), from = i + 1;
-	}
-	out.push(selector.slice(from).trim());
-	return out.filter(Boolean);
-}
-function join(parent, prelude) {
-	if (!parent) return prelude;
-	const parents = splitList(parent);
-	return splitList(prelude).flatMap((s) => parents.map((p) => s.includes("&") ? s.replaceAll("&", p) : `${p} ${s}`)).join(", ");
-}
-function touchBetween(file, old, next) {
-	if (old === next) return null;
-	const { before, after } = changedLines(old, next);
-	if (!before.length) return null;
-	return {
-		before: {
-			lines: before,
-			hints: describe(file, old, before)
-		},
-		after: {
-			lines: after,
-			hints: describe(file, next, after)
-		}
-	};
-}
 // packages/claude-plugin/src/protocol.ts
 /** The file the bridge advertises itself in, read by the Vite plugin. */
 const bridgeFile = (gitDir) => path.join(gitDir, "stift", "bridge.json");
