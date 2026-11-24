@@ -7,6 +7,8 @@ import os, { platform, release } from "node:os";
 import path, { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, execFileSync, spawnSync } from "node:child_process";
+import https from "node:https";
+import tls from "node:tls";
 import { promisify } from "node:util";
 import http from "node:http";
 import { dirname, isAbsolute as isAbsolute$1, posix, relative, sep } from "path";
@@ -590,6 +592,33 @@ var Changes = class Changes {
 		}
 		return names.filter((f) => f.endsWith(".json")).map((f) => readJson$1(path.join(dir, "files", f))).filter((t) => t !== null);
 	}
+	/**
+	* The working tree's files (tracked and new, .gitignore applied) as one tree id: equal ids, same files. Starts from a
+	* copy of the user's index, so only files changed since are read; the user's index stays as it is.
+	*/
+	snapshot() {
+		const index = path.join(this.dir, "index.snapshot");
+		try {
+			const user = path.join(this.gitDir, "index");
+			if (fs.existsSync(user)) fs.copyFileSync(user, index);
+			else fs.rmSync(index, { force: true });
+			git$3([
+				"add",
+				"-A",
+				"--",
+				"."
+			], {
+				cwd: this.top,
+				index
+			});
+			return git$3(["write-tree"], {
+				cwd: this.top,
+				index
+			}).out;
+		} finally {
+			fs.rmSync(index, { force: true });
+		}
+	}
 	/** Running tasks (comments being made) and the files they touched. */
 	activeTasks() {
 		const root = path.join(this.dir, "tasks");
@@ -1111,6 +1140,69 @@ function saveAttachments(dir, list) {
 }
 /** The brief's line for them: the session Reads each file itself. */
 const attachedLine = (files) => files.length ? `\nThe user attached ${files.length === 1 ? "a file" : `${files.length} files`} to the comment; Read ${files.length === 1 ? "it" : "them"}: ${files.join(", ")}` : "";
+// packages/claude-plugin/src/dev-fetch.ts
+let fromBinary;
+/** mkcert's root CA file: in $CAROOT, mkcert's default folder, or where `mkcert -CAROOT` says. Null without mkcert. */
+function mkcertRoot() {
+	const file = (dir) => dir && fs.existsSync(path.join(dir, "rootCA.pem")) ? path.join(dir, "rootCA.pem") : null;
+	if (process.env.CAROOT) return file(process.env.CAROOT);
+	const home = os.homedir();
+	const found = file(process.platform === "darwin" ? path.join(home, "Library/Application Support/mkcert") : process.platform === "win32" ? path.join(process.env.LOCALAPPDATA ?? "", "mkcert") : path.join(process.env.XDG_DATA_HOME || path.join(home, ".local/share"), "mkcert"));
+	if (found) return found;
+	if (fromBinary === void 0) try {
+		fromBinary = file(execFileSync("mkcert", ["-CAROOT"], {
+			encoding: "utf8",
+			stdio: [
+				"ignore",
+				"pipe",
+				"ignore"
+			],
+			timeout: 3e3
+		}).trim());
+	} catch {
+		fromBinary = null;
+	}
+	return fromBinary;
+}
+/**
+* fetch for GET requests to the dev server (`origin`, by default the URL's own): an https:// one also trusts mkcert's
+* root CA. Follows redirects; a URL on another origin, or a redirect to one, gets plain fetch.
+*/
+async function devFetch(url, init = {}) {
+	let u = new URL(url);
+	const origin = init.origin ?? u.origin;
+	const plain = () => fetch(u, {
+		headers: init.headers,
+		signal: init.signal
+	});
+	const root = u.protocol === "https:" && u.origin === origin ? mkcertRoot() : null;
+	if (!root) return plain();
+	const ca = [...tls.getCACertificates?.("default") ?? tls.rootCertificates, fs.readFileSync(root, "utf8")];
+	for (let hops = 0;; hops++) {
+		const r = await new Promise((resolve, reject) => {
+			https.get(u, {
+				ca,
+				headers: init.headers,
+				signal: init.signal
+			}, (res) => {
+				const body = [];
+				res.on("data", (c) => body.push(c)).on("error", reject).on("end", () => {
+					const headers = new Headers();
+					for (let i = 0; i < res.rawHeaders.length; i += 2) headers.append(res.rawHeaders[i], res.rawHeaders[i + 1]);
+					const r = new Response([204, 304].includes(res.statusCode) ? null : Buffer.concat(body), {
+						status: res.statusCode,
+						headers
+					});
+					resolve(Object.defineProperty(r, "url", { value: u.href }));
+				});
+			}).on("error", reject);
+		});
+		const to = r.headers.get("location");
+		if (r.status < 300 || r.status > 399 || !to || hops === 5) return r;
+		u = new URL(to, u);
+		if (u.origin !== origin) return plain();
+	}
+}
 // packages/claude-plugin/src/frames.ts
 /** React's own frames at the top of an owner stack: where JSX was created, not by whom. */
 const INTERNAL = /^(fakeJSXCallSite|(exports\.|Object\.)?(jsx|jsxs|jsxDEV|createElement|react_stack_bottom_frame))$/;
@@ -1192,7 +1284,7 @@ const isLocal = (u) => [
 	"[::1]"
 ].includes(u.hostname);
 async function text(url) {
-	const r = await fetch(url, { signal: AbortSignal.timeout(5e3) });
+	const r = await devFetch(url, { signal: AbortSignal.timeout(5e3) });
 	if (!r.ok) throw new Error(`${r.status} ${url}`);
 	return r.text();
 }
@@ -14346,11 +14438,17 @@ var Bridge = class {
 	reviewJob = null;
 	/** An error the page showed that the user asked the session to fix (Fix in Claude). */
 	errorJob = null;
+	/** The title of the error job in the session's hands, should it have to be handed out again. */
+	errorTitle;
 	/** The last undo or redo that failed, for Fix in Claude. */
 	historyError = null;
 	/** The user's edits to summarize before a switch (`brief`), until the session takes it; `subject` is its commit subject. */
 	summaryJob = null;
 	summarySubject;
+	/** The files of the summary job in the session's hands: its report counts only while the question is about them. */
+	summaryFiles = null;
+	/** A switch's git work (commit, push, switch) is running: no other may start until it ends, whatever the page shows. */
+	switchRunning = false;
 	/** HEAD when the change list was last sent: a commit or switch by anyone else sends it again. */
 	lastHead = null;
 	/** Why comments wait now (a rebase in progress, a detached HEAD), as last told to the pages. */
@@ -14365,6 +14463,8 @@ var Bridge = class {
 	hookSession;
 	/** The base being brought up to origin's before a comment starts a feature on it (`updatingBase`). */
 	baseUpdate = null;
+	/** Comments whose outcome is known but can't be written yet (the checkout is changing): settled when it's free. */
+	waiting = [];
 	constructor(repoDir, opts = {}) {
 		this.cl = new Changes(repoDir);
 		this.opts = opts;
@@ -14372,6 +14472,10 @@ var Bridge = class {
 			stift_session: this.sessionId,
 			claude_session: opts.owner?.sessionId
 		});
+	}
+	/** Whether this bridge serves the repository now: not before it bound the port, nor after another session took it. */
+	get serving() {
+		return !!this.server;
 	}
 	get port() {
 		return this.opts.port ?? bridgePort(this.cl.top);
@@ -14403,6 +14507,7 @@ var Bridge = class {
 					if (i > 30) throw new Error(`Port ${this.port} is in use by another program. Set STIFT_PORT to a free port in the environment of both Claude Code and the dev server.`);
 					await new Promise((r) => setTimeout(r, 100));
 				}
+				this.reset();
 				this.branch = this.cl.branch();
 				this.load();
 				fs.mkdirSync(path.dirname(bridgeFile(this.cl.gitDir)), { recursive: true });
@@ -14464,6 +14569,28 @@ var Bridge = class {
 		this.listening = false;
 		this.answer(removed ? "removed" : "released");
 		await this.stop();
+		this.reset();
+	}
+	/**
+	* Forgets the repository's state: another session's bridge has it now, and changes it (the inbox, the branch, its
+	* own jobs). Git work still running here (a switch, the base update) finishes, and keeps its lock until then.
+	*/
+	reset() {
+		this.comments.clear();
+		this.activeId = null;
+		this.waiter = null;
+		this.waiting = [];
+		this.reviewState = { phase: "idle" };
+		this.dropReviewJob();
+		this.errorJob = null;
+		this.historyError = null;
+		this.summaryJob = null;
+		this.summaryFiles = null;
+		this.summarySubject = void 0;
+		this.switching = void 0;
+		this.branch = void 0;
+		this.blockedWhy = null;
+		this.lastHead = null;
 	}
 	request(req, res) {
 		const origin = req.headers.origin;
@@ -14550,7 +14677,10 @@ var Bridge = class {
 		const ac = new AbortController();
 		res.on("close", () => ac.abort());
 		const a = await this.wait(String(body.waiter ?? ""), body.first === true, Math.min(Number(body.holdMs ?? 0), 6e5), ac.signal);
-		if (ac.signal.aborted) return;
+		if (ac.signal.aborted) {
+			if (typeof a !== "string" && a.job) this.undeliver(a.job);
+			return;
+		}
 		json(typeof a === "string" ? { kind: a } : {
 			kind: "wake",
 			wake: a
@@ -14661,8 +14791,18 @@ var Bridge = class {
 	*/
 	settle(c, status, message) {
 		const id = c.record.payload.id;
+		if (this.activeId === id) this.cl.finishTask(MAIN_AGENT), this.cl.setActive(null);
+		const hold = this.settleHold(status);
+		if (hold) {
+			this.waiting = [...this.waiting.filter((w) => w.c !== c), {
+				c,
+				status,
+				message
+			}];
+			if (c.record.message !== `Waiting · ${hold}`) this.setStatus(c, c.record.status, `Waiting · ${hold}`);
+			return;
+		}
 		try {
-			if (this.activeId === id) this.cl.finishTask(MAIN_AGENT);
 			if (status === "failed") {
 				const stuck = this.cl.discardPending(id);
 				if (stuck.length) c.record.notes = [.../* @__PURE__ */ new Set([...c.record.notes ?? [], `Couldn't take its edits out of ${stuck.join(", ")}, which you edited since.`])];
@@ -14731,9 +14871,9 @@ var Bridge = class {
 				}, conn);
 			} else if (msg.type === "review") this.review();
 			else if (msg.type === "features") this.refreshFeatures(1e4);
-			else if (msg.type === "switch") this.requestSwitch(msg.branch);
-			else if (msg.type === "new-feature") this.requestSwitch(null);
-			else if (msg.type === "switch-answer") this.answerSwitch(msg.answer);
+			else if (msg.type === "switch") this.requestSwitch(msg.branch, conn);
+			else if (msg.type === "new-feature") this.requestSwitch(null, conn);
+			else if (msg.type === "switch-answer") this.answerSwitch(msg.answer, conn);
 			else if (msg.type === "fix") this.fixError(msg.error, conn);
 		};
 	}
@@ -14958,7 +15098,7 @@ var Bridge = class {
 	/** Tries the direct write. True when the bridge wrote it and the comment now waits for the page. */
 	writeText(c) {
 		const p = c.record.payload;
-		if (this.cl.blocked()) return false;
+		if (this.cl.blocked() || this.checkoutBusy() || this.updatingBase(c)) return false;
 		this.onFeature(c);
 		c.startedAt ??= Date.now();
 		c.attempt = 1;
@@ -15005,7 +15145,7 @@ var Bridge = class {
 	}
 	verified(id, attempt, a) {
 		const c = this.comments.get(id);
-		if (!c || c.phase !== "arriving" || c.attempt !== attempt) return;
+		if (!c || c.phase !== "arriving" || c.attempt !== attempt || this.waiting.some((w) => w.c === c)) return;
 		c.record.notes = [.../* @__PURE__ */ new Set([...c.record.notes ?? [], ...a.notes])];
 		const files = (c.record.files ?? []).join(", ");
 		if (a.outcome === "applied") return this.settle(c, "applied", `Changed ${files}`);
@@ -15057,6 +15197,7 @@ var Bridge = class {
 			const j = this.summaryJob;
 			this.summaryJob = null;
 			this.activeId = SUMMARY;
+			this.summaryFiles = j.files;
 			this.cl.setActive(null);
 			lines.push(`▶ stift summary · your edits in ${j.files.length} file${j.files.length > 1 ? "s" : ""}, before switching branches`);
 			return {
@@ -15084,9 +15225,10 @@ var Bridge = class {
 				}
 			};
 		}
-		if (!this.activeId && this.errorJob) {
+		if (!this.activeId && this.errorJob && !this.checkoutBusy()) {
 			const e = this.errorJob;
 			this.errorJob = null;
+			this.errorTitle = e.title;
 			this.activeId = FIX_ERROR;
 			this.cl.setActive(null);
 			lines.push(`▶ stift fix · ${short(e.title, 80)}`);
@@ -15100,7 +15242,7 @@ var Bridge = class {
 				}
 			};
 		}
-		const why = this.cl.blocked();
+		const why = this.cl.blocked() ?? this.checkoutBusy();
 		if (why !== this.blockedWhy) {
 			this.blockedWhy = why;
 			for (const c of this.queue()) this.setStatus(c, c.record.status, why ? `Waiting · ${why}` : void 0);
@@ -15147,6 +15289,41 @@ var Bridge = class {
 	* session has one waiter.
 	*/
 	async wait(waiter, first, holdMs, signal) {
+		const a = await this.waitFor(waiter, first, holdMs, signal);
+		if (signal?.aborted && typeof a !== "string" && a.job) {
+			this.undeliver(a.job);
+			return "idle";
+		}
+		return a;
+	}
+	/**
+	* Takes back a job the session never got: a comment goes back to the head of the queue with its attempt not counted,
+	* and the other jobs wait to be handed out again.
+	*/
+	undeliver(job) {
+		if (this.activeId !== job.id) return;
+		this.activeId = null;
+		this.cl.setActive(null);
+		if (job.kind === "summary") this.summaryJob ??= {
+			files: this.summaryFiles ?? [],
+			brief: job.brief
+		};
+		else if (job.kind === "error") this.errorJob ??= {
+			title: this.errorTitle ?? "the error",
+			brief: job.brief
+		};
+		else if (job.kind === "comment" || job.kind === "fix") {
+			const c = this.comments.get(job.id);
+			if (c?.phase === "working") {
+				c.attempt = Math.max(0, c.attempt - 1);
+				c.phase = "queued";
+				c.announced = false;
+				this.setStatus(c, c.next === "fix" ? "fixing" : "queued", c.next === "fix" ? c.record.message : void 0);
+				this.reorder();
+			}
+		}
+	}
+	async waitFor(waiter, first, holdMs, signal) {
 		if (first) {
 			this.answer("quiet");
 			this.finishActive();
@@ -15215,14 +15392,27 @@ var Bridge = class {
 		const c = this.activeId ? this.comments.get(this.activeId) : void 0;
 		this.activeId = null;
 		this.cl.setActive(null);
-		if (!c || c.phase !== "working") return;
+		if (!c || c.phase !== "working" || this.waiting.some((w) => w.c === c)) return;
 		this.generation(c, c.since);
 		const r = this.cl.finishTask(MAIN_AGENT);
-		if (!r?.files.length) return this.settle(c, "failed", c.attempt > 1 ? `The fix changed no files.\n${c.errors.join("\n")}` : "No files were changed.");
+		if (!r?.files.length) return this.settle(c, "failed", this.noEdits(c));
 		c.record.files = r.files;
 		c.phase = "arriving";
 		this.setStatus(c, "arriving");
 		this.askVerify(c);
+	}
+	/**
+	* Why a turn recorded no edit for the comment: files changed all the same (with Bash, a subagent or another tool the
+	* hooks don't record), or none did.
+	*/
+	noEdits(c) {
+		let outside = false;
+		try {
+			outside = !!c.snapshot && this.cl.snapshot() !== c.snapshot;
+		} catch {}
+		const errors = c.attempt > 1 && c.errors.length ? `\n${c.errors.join("\n")}` : "";
+		if (outside) return `Files changed, but not with the Edit or Write tools, so stift couldn't tell they were this change's: they stay uncommitted.${errors}`;
+		return `${c.attempt > 1 ? "The fix changed no files." : "No files were changed."}${errors}`;
 	}
 	/**
 	* The session's turn for a comment, as one $ai_generation event: the model, tokens and time; the tool calls (names,
@@ -15303,7 +15493,7 @@ var Bridge = class {
 		this.baseUpdate ??= updateBase(this.cl.top, w).finally(() => {
 			this.baseUpdate = null;
 			for (const q of this.queue()) q.baseUpdated = true;
-			this.kick();
+			this.checkoutFree();
 		});
 		return true;
 	}
@@ -15338,6 +15528,11 @@ var Bridge = class {
 		c.phase = "working";
 		this.activeId = id;
 		this.cl.setActive(id, this.hookSession);
+		try {
+			c.snapshot = this.cl.snapshot();
+		} catch {
+			c.snapshot = void 0;
+		}
 		this.setStatus(c, c.next === "fix" ? "fixing" : "working", c.next === "fix" ? c.record.message : void 0);
 		this.reorder();
 		return {
@@ -15431,6 +15626,7 @@ var Bridge = class {
 			if (this.cl.head() !== this.lastHead) this.sendChanges();
 		}
 		if (this.blockedWhy) this.kick();
+		if (this.waiting.length) this.settleWaiting();
 	}
 	/** The user switched branches (with git or the shelf): comments now go onto the branch checked out. */
 	watchBranch() {
@@ -15459,6 +15655,8 @@ var Bridge = class {
 	* from the page's buttons and shortcuts or the session. Returns the line for the bar.
 	*/
 	history(verb) {
+		const busy = this.checkoutBusy();
+		if (busy) return `Busy · ${busy} Try again when it's done.`;
 		let line;
 		try {
 			const r = verb === "undo" ? this.cl.undo(this.listBase()) : this.cl.redo();
@@ -15494,6 +15692,7 @@ var Bridge = class {
 			type: "review",
 			state
 		});
+		if (state.phase === "done" && !state.open) this.reviewState = { phase: "idle" };
 	}
 	/** The review job is over: its description file goes with it. */
 	dropReviewJob() {
@@ -15674,8 +15873,36 @@ var Bridge = class {
 	/** Why the checkout can't change now, or null. A summary in the session's hands doesn't count: it only reads. */
 	busySwitching() {
 		if (this.switching?.phase === "switching") return "A switch is in progress.";
-		if (this.activeId && this.activeId !== SUMMARY || this.cl.activeTasks().length) return "A change is in progress: switch when it is done.";
+		const lock = this.checkoutBusy();
+		if (lock) return lock;
+		if (this.activeId && this.activeId !== SUMMARY || this.cl.activeTasks().length || this.waiting.length) return "A change is in progress: switch when it is done.";
+		if ([...this.comments.values()].some((c) => c.phase === "arriving")) return "A change waits for the page to confirm it: switch when it is done.";
 		return null;
+	}
+	/**
+	* The checkout lock: a switch's git work or the base update is changing the checkout (asynchronously). Nothing else
+	* that changes it may run meanwhile: comments and error fixes aren't handed out, direct text edits wait for the
+	* session, commits and discards of a comment's hunks wait (`waiting`), and undo and redo say busy. Returns why.
+	*/
+	checkoutBusy() {
+		if (this.switchRunning) return "A switch is in progress.";
+		if (this.baseUpdate) return "The base branch is being brought up to date.";
+		return null;
+	}
+	/** The checkout lock was let go: what waited for it goes now. */
+	checkoutFree() {
+		if (this.checkoutBusy()) return;
+		this.settleWaiting();
+		this.kick();
+	}
+	/** Settles the comments that waited for the checkout, while it's free. */
+	settleWaiting() {
+		for (const w of [...this.waiting]) if (w.c.phase === "settled") this.waiting = this.waiting.filter((x) => x !== w);
+		else if (!this.settleHold(w.status)) this.waiting = this.waiting.filter((x) => x !== w), this.settle(w.c, w.status, w.message);
+	}
+	/** Why a comment's outcome can't be written now: a commit needs a branch to go on; taking edits out doesn't. */
+	settleHold(status) {
+		return this.checkoutBusy() ?? (status === "failed" ? null : this.cl.blocked());
 	}
 	say(sw) {
 		this.switching = sw;
@@ -15686,9 +15913,10 @@ var Bridge = class {
 	* the user's own (stift's integration left out), it asks first (`answerSwitch`): Publish commits them on the feature
 	* checked out, Keep carries them along uncommitted. The listening session writes their tl;dr meanwhile.
 	*/
-	requestSwitch(to) {
+	requestSwitch(to, conn) {
+		if (this.switchBusyNotice(conn)) return;
 		const busy = this.busySwitching();
-		if (busy) return this.say({
+		if (busy) return this.summaryJob = null, this.say({
 			phase: "failed",
 			reason: busy
 		});
@@ -15696,7 +15924,7 @@ var Bridge = class {
 		try {
 			files = localChanges(this.cl.top);
 		} catch {}
-		if (!files.length) return void this.doSwitch(to, false);
+		if (!files.length) return this.summaryJob = null, void this.doSwitch(to, false);
 		let w = null;
 		try {
 			w = this.wf();
@@ -15725,6 +15953,7 @@ var Bridge = class {
 	reportSummary(a) {
 		const sw = this.switching;
 		if (sw?.phase !== "asking") return "The user already answered: nothing more to do.";
+		if (this.summaryFiles?.join("\0") !== sw.files.join("\0")) return "The user's edits changed since: nothing more to do.";
 		const words = (a.summary ?? "").trim().split(/[ \t]+/);
 		const summary = words.length > 200 ? `${words.slice(0, 200).join(" ")}…` : words.join(" ");
 		this.summarySubject = a.subject?.trim().split("\n")[0] || void 0;
@@ -15741,9 +15970,10 @@ var Bridge = class {
 	* The user's answer: Publish (commit their edits on the feature and push it, with any commits not pushed yet, then
 	* switch), Keep (switch, edits stay uncommitted) or Cancel.
 	*/
-	async answerSwitch(answer) {
+	async answerSwitch(answer, conn) {
 		const sw = this.switching;
 		if (sw?.phase !== "asking") return;
+		if (this.switchBusyNotice(conn)) return;
 		this.summaryJob = null;
 		if (answer === "cancel") return this.say(void 0);
 		const busy = this.busySwitching();
@@ -15751,6 +15981,27 @@ var Bridge = class {
 			phase: "failed",
 			reason: busy
 		});
+		this.switchRunning = true;
+		try {
+			await this.publishAndSwitch(sw, answer);
+		} finally {
+			this.switchRunning = false;
+			this.checkoutFree();
+		}
+	}
+	/**
+	* A switch is running: the page that asked for another hears so, and the running one keeps its state on every page
+	* (showing it failed would let the shelves ask again). True when it told the page.
+	*/
+	switchBusyNotice(conn) {
+		if (!this.switchRunning) return false;
+		this.send({
+			type: "notice",
+			text: "Busy · A switch is in progress. Try again when it's done."
+		}, conn);
+		return true;
+	}
+	async publishAndSwitch(sw, answer) {
 		if (answer === "publish") {
 			const branch = sw.publish;
 			if (!branch || this.cl.branch() !== branch) return this.say({
@@ -15804,6 +16055,7 @@ var Bridge = class {
 	async doSwitch(to, stash) {
 		let r;
 		let branch = to ?? "";
+		this.switchRunning = true;
 		try {
 			if (to === null) {
 				const w = this.wf();
@@ -15825,6 +16077,8 @@ var Bridge = class {
 				ok: false,
 				error: firstLine(e.message)
 			};
+		} finally {
+			this.switchRunning = false;
 		}
 		this.switching = !r.ok ? {
 			phase: "failed",
@@ -15837,6 +16091,7 @@ var Bridge = class {
 		this.watchBranch();
 		this.sendFeatures();
 		this.sendChanges();
+		this.checkoutFree();
 	}
 };
 const firstLine = (s) => short(s.split("\n")[0], 120);
@@ -16011,15 +16266,24 @@ const readJson = (file) => {
 		return;
 	}
 };
+const truthy = (v) => /^(1|true|yes|on)$/i.test(v?.trim() ?? "");
 /**
-* Whether the stift marketplace auto-updates: `on` or `off` as the person chose, `unset`, or `none` when there's
-* nothing to ask (no marketplace from GitHub, such as an older install from a local directory).
+* Whether Claude Code skips plugin auto-update whatever the marketplace says: DISABLE_UPDATES, DISABLE_AUTOUPDATER and
+* CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC turn the whole pass off (and hide the toggle), unless
+* FORCE_AUTOUPDATE_PLUGINS turns it back on (https://code.claude.com/docs/en/plugins/loading, "When auto-update runs").
+*/
+const updatesDisabled = (env) => !truthy(env.FORCE_AUTOUPDATE_PLUGINS) && (truthy(env.DISABLE_UPDATES) || truthy(env.DISABLE_AUTOUPDATER) || !!env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC);
+/**
+* Whether the stift marketplace auto-updates: `on` or `off` as the person chose, `unset`, `disabled` when Claude Code's
+* environment turns plugin auto-update off, or `none` when there's nothing to ask (no marketplace from GitHub, such as
+* an older install from a local directory).
 */
 function autoUpdateState(env = process.env) {
 	const entry = readJson(path.join(configDir(env), "settings.json"))?.extraKnownMarketplaces?.[NAME];
 	const known = readJson(path.join(configDir(env), "plugins", "known_marketplaces.json"))?.[NAME];
 	const source = (entry ?? known)?.source?.source;
 	if (!source || source === "directory" || source === "file") return "none";
+	if (updatesDisabled(env)) return "disabled";
 	const on = entry?.autoUpdate ?? known?.autoUpdate;
 	return on === void 0 ? "unset" : on ? "on" : "off";
 }
@@ -16041,124 +16305,130 @@ function autoUpdateQuestion(record, env = process.env) {
 	return `First, ask the user this one question, with "Yes" as the first, preselected option: "Turn on auto-update for stift? Claude Code would fetch new stift versions by itself in the background; they load in your next session." Options: "Yes, turn it on" and "No". Record the answer with ${record("true")} (or false for No). Ask it only this once.`;
 }
 // packages/claude-plugin/src/tools.ts
-const tools = (bridge) => [
-	{
-		name: "start_listening",
-		description: "Start listening for comments from the stift browser overlay in this session (/stift:start). Afterwards end your turn: stift wakes this session with each comment, one at a time.",
-		inputSchema: {
-			type: "object",
-			properties: {},
-			additionalProperties: false
+/** Why a tool that works on the comments, the review, the switch or the branch is refused while this bridge doesn't serve. */
+const NOT_SERVING = "This session's stift bridge doesn't serve this repository now: another session took it over (or stift was removed). Run /stift:start to take it back; nothing was changed.";
+const tools = (bridge) => {
+	/** Refused while another session's bridge has the repository: this one's memory of it is gone. */
+	const served = (run) => (a, signal) => bridge.serving ? run(a, signal) : Promise.reject(/* @__PURE__ */ new Error(NOT_SERVING));
+	return [
+		{
+			name: "start_listening",
+			description: "Start listening for comments from the stift browser overlay in this session (/stift:start). Afterwards end your turn: stift wakes this session with each comment, one at a time.",
+			inputSchema: {
+				type: "object",
+				properties: {},
+				additionalProperties: false
+			},
+			async run() {
+				if (await bridge.arm()) return "Already listening; listening goes on by itself. End your turn now with no text.";
+				const ask = autoUpdateQuestion((on) => `the set_auto_update tool ({"on": ${on}})`);
+				return `Listening for stift comments.${ask && ` ${ask}`} Say "Listening for comments from the browser." to the user and end your turn: stift wakes this session with each comment.`;
+			}
 		},
-		async run() {
-			if (await bridge.arm()) return "Already listening; listening goes on by itself. End your turn now with no text.";
-			const ask = autoUpdateQuestion((on) => `the set_auto_update tool ({"on": ${on}})`);
-			return `Listening for stift comments.${ask && ` ${ask}`} Say "Listening for comments from the browser." to the user and end your turn: stift wakes this session with each comment.`;
-		}
-	},
-	{
-		name: "set_auto_update",
-		description: "Record the user's answer to stift's auto-update question: whether Claude Code updates the stift plugin by itself.",
-		inputSchema: {
-			type: "object",
-			properties: { on: { type: "boolean" } },
-			required: ["on"],
-			additionalProperties: false
+		{
+			name: "set_auto_update",
+			description: "Record the user's answer to stift's auto-update question: whether Claude Code updates the stift plugin by itself.",
+			inputSchema: {
+				type: "object",
+				properties: { on: { type: "boolean" } },
+				required: ["on"],
+				additionalProperties: false
+			},
+			run: async (a) => setAutoUpdate(a.on === true)
 		},
-		run: async (a) => setAutoUpdate(a.on === true)
-	},
-	{
-		name: "stop_listening",
-		description: "Stop listening for stift comments in this session (/stift:stop). Comments made afterwards are held until a session listens again.",
-		inputSchema: {
-			type: "object",
-			properties: {},
-			additionalProperties: false
+		{
+			name: "stop_listening",
+			description: "Stop listening for stift comments in this session (/stift:stop). Comments made afterwards are held until a session listens again.",
+			inputSchema: {
+				type: "object",
+				properties: {},
+				additionalProperties: false
+			},
+			async run() {
+				bridge.disarm();
+				return "Stopped listening for stift comments. Changes the browser asks for now are held until /stift:start.";
+			}
 		},
-		async run() {
-			bridge.disarm();
-			return "Stopped listening for stift comments. Changes the browser asks for now are held until /stift:start.";
-		}
-	},
-	{
-		name: "report_comment",
-		description: "Settle a stift comment yourself: \"failed\" when it cannot be done (for example it asks for something outside the code), or \"done\" when no file change is needed. Other comments resolve on their own once your turn ends and the browser shows the change.",
-		inputSchema: {
-			type: "object",
-			properties: {
-				id: {
-					type: "string",
-					description: "Comment id, such as c_m3x1k2."
+		{
+			name: "report_comment",
+			description: "Settle a stift comment yourself: \"failed\" when it cannot be done (for example it asks for something outside the code), or \"done\" when no file change is needed. Other comments resolve on their own once your turn ends and the browser shows the change.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					id: {
+						type: "string",
+						description: "Comment id, such as c_m3x1k2."
+					},
+					status: {
+						type: "string",
+						enum: ["done", "failed"]
+					},
+					message: {
+						type: "string",
+						description: "Shown to the user in the overlay."
+					}
 				},
-				status: {
-					type: "string",
-					enum: ["done", "failed"]
+				required: [
+					"id",
+					"status",
+					"message"
+				],
+				additionalProperties: false
+			},
+			run: served(async (a) => bridge.report(a.id, a.status, a.message))
+		},
+		{
+			name: "report_review",
+			description: "Finish a stift review job: url of the pull request you opened or updated; or noTool with title and body (Markdown) when you have no tool for it, and stift links the user to the host's page; or error with one short reason.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					url: { type: "string" },
+					noTool: { type: "boolean" },
+					title: { type: "string" },
+					body: { type: "string" },
+					error: { type: "string" }
 				},
-				message: {
-					type: "string",
-					description: "Shown to the user in the overlay."
-				}
+				additionalProperties: false
 			},
-			required: [
-				"id",
-				"status",
-				"message"
-			],
-			additionalProperties: false
+			run: served(async (a) => bridge.reportReview(a))
 		},
-		run: async (a) => bridge.report(a.id, a.status, a.message)
-	},
-	{
-		name: "report_review",
-		description: "Finish a stift review job: url of the pull request you opened or updated; or noTool with title and body (Markdown) when you have no tool for it, and stift links the user to the host's page; or error with one short reason.",
-		inputSchema: {
-			type: "object",
-			properties: {
-				url: { type: "string" },
-				noTool: { type: "boolean" },
-				title: { type: "string" },
-				body: { type: "string" },
-				error: { type: "string" }
+		{
+			name: "report_summary",
+			description: "Finish a stift summary job: the tl;dr of the user's own uncommitted edits (at most 200 words) and a one-line commit subject for them.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					summary: { type: "string" },
+					subject: { type: "string" }
+				},
+				required: ["summary", "subject"],
+				additionalProperties: false
 			},
-			additionalProperties: false
+			run: served(async (a) => bridge.reportSummary(a))
 		},
-		run: async (a) => bridge.reportReview(a)
-	},
-	{
-		name: "report_summary",
-		description: "Finish a stift summary job: the tl;dr of the user's own uncommitted edits (at most 200 words) and a one-line commit subject for them.",
-		inputSchema: {
-			type: "object",
-			properties: {
-				summary: { type: "string" },
-				subject: { type: "string" }
+		{
+			name: "undo",
+			description: "Undo the newest stift change on the feature branch: its commit is dropped (or, once pushed, reverted with a new commit), and its hunks leave the working tree; the user's own edits stay. Latest only: call it again to go one further.",
+			inputSchema: {
+				type: "object",
+				properties: {},
+				additionalProperties: false
 			},
-			required: ["summary", "subject"],
-			additionalProperties: false
+			run: served(async () => bridge.history("undo"))
 		},
-		run: async (a) => bridge.reportSummary(a)
-	},
-	{
-		name: "undo",
-		description: "Undo the newest stift change on the feature branch: its commit is dropped (or, once pushed, reverted with a new commit), and its hunks leave the working tree; the user's own edits stay. Latest only: call it again to go one further.",
-		inputSchema: {
-			type: "object",
-			properties: {},
-			additionalProperties: false
-		},
-		run: async () => bridge.history("undo")
-	},
-	{
-		name: "redo",
-		description: "Redo the last undo, while nothing else changed the branch since.",
-		inputSchema: {
-			type: "object",
-			properties: {},
-			additionalProperties: false
-		},
-		run: async () => bridge.history("redo")
-	}
-];
+		{
+			name: "redo",
+			description: "Redo the last undo, while nothing else changed the branch since.",
+			inputSchema: {
+				type: "object",
+				properties: {},
+				additionalProperties: false
+			},
+			run: served(async () => bridge.history("redo"))
+		}
+	];
+};
 // packages/claude-plugin/src/server.ts
 const bridge = new Bridge(process.env.CLAUDE_PROJECT_DIR ?? process.cwd(), { owner: owner() });
 serve({

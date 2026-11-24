@@ -579,6 +579,33 @@ var Changes = class Changes {
 		}
 		return names.filter((f) => f.endsWith(".json")).map((f) => readJson(path.join(dir, "files", f))).filter((t) => t !== null);
 	}
+	/**
+	* The working tree's files (tracked and new, .gitignore applied) as one tree id: equal ids, same files. Starts from a
+	* copy of the user's index, so only files changed since are read; the user's index stays as it is.
+	*/
+	snapshot() {
+		const index = path.join(this.dir, "index.snapshot");
+		try {
+			const user = path.join(this.gitDir, "index");
+			if (fs.existsSync(user)) fs.copyFileSync(user, index);
+			else fs.rmSync(index, { force: true });
+			git([
+				"add",
+				"-A",
+				"--",
+				"."
+			], {
+				cwd: this.top,
+				index
+			});
+			return git(["write-tree"], {
+				cwd: this.top,
+				index
+			}).out;
+		} finally {
+			fs.rmSync(index, { force: true });
+		}
+	}
 	/** Running tasks (comments being made) and the files they touched. */
 	activeTasks() {
 		const root = path.join(this.dir, "tasks");
