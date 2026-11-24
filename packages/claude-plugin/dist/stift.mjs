@@ -2404,6 +2404,8 @@ function decode(s) {
 *   at Hero (about://React/Prerender/file:///app/.next/…/chunk.js?id=%255Bproject%255D/src/hero.tsx+…?98:81:426)
 *   at Page (rsc://React/Server/file:///app/.next/…/chunk.js?7:3:9)
 *   at helper (http://localhost:3000/_next/static/chunks/x.js?id=%255Bproject%255D/src/lib.ts+…:12:11)   a hot-updated module
+*   at Hero (webpack-internal:///(app-pages-browser)/./app/hero.tsx:43:87)                   webpack, client module
+*   at Card (about://React/Server/webpack-internal:///(rsc)/./app/page.tsx?5:34:87)          webpack, server component
 */
 function parseFrame(line) {
 	const m = line.match(/^\s*at (?:async )?(?:(.+?) \((.+):(\d+):(\d+)\)|(.+):(\d+):(\d+))\s*$/);
@@ -2414,7 +2416,17 @@ function parseFrame(line) {
 		line: +(m[3] ?? m[6]),
 		column: +(m[4] ?? m[7])
 	};
+	const replayed = /^(about|rsc):\/\/React\//.test(loc);
 	loc = loc.replace(/^(about|rsc):\/\/React\/[^/]+\//, "");
+	if (loc.startsWith("webpack-internal:///")) {
+		const id = loc.slice(20);
+		return {
+			fn,
+			kind: "webpack",
+			where: replayed ? id.replace(/\?\d+$/, "") : id,
+			...pos
+		};
+	}
 	const q = loc.indexOf("?");
 	const module = (q < 0 ? "" : decode(loc.slice(q + 1))).match(/(?:^|[?&])id=(\[project\]\/[^\s+?&]+)/)?.[1];
 	if (/^https?:\/\//.test(loc)) return {
@@ -2495,10 +2507,8 @@ async function loadMap(f, scope) {
 		const ref = code.match(/\/\/# sourceMappingURL=(\S+)\s*$/)?.[1];
 		if (ref) {
 			let json;
-			if (ref.startsWith("data:")) {
-				const data = ref.slice(ref.indexOf(",") + 1);
-				json = /;base64,/.test(ref) ? Buffer.from(data, "base64").toString("utf8") : decodeURIComponent(data);
-			} else if (f.kind === "file") {
+			if (ref.startsWith("data:")) json = inline(ref);
+			else if (f.kind === "file") {
 				const file = path.join(path.dirname(f.where), decode(ref));
 				if (!inside(file, scope.top)) throw new Error("map outside the repository");
 				json = fs.readFileSync(file, "utf8");
@@ -2523,11 +2533,93 @@ async function loadMap(f, scope) {
 	if (fetched) fetchedAt.set(key, Date.now());
 	return loaded;
 }
-/** A map source to a path on disk: `file:///abs`, Turbopack's `[project]/x`, an absolute path, or relative to the chunk. */
+/** An inline map's JSON (`data:application/json;base64,…`). */
+function inline(ref) {
+	const data = ref.slice(ref.indexOf(",") + 1);
+	return /;base64,/.test(ref) ? Buffer.from(data, "base64").toString("utf8") : decodeURIComponent(data);
+}
+/**
+* Where `next dev --webpack` writes the chunks it serves, under .next/ (.next/dev/ from Next.js 16). Client chunks
+* first: a pages router module is in the server bundle too, compiled differently, and the browser ran the client's.
+* Vendor chunks hold node_modules only.
+*/
+const WEBPACK_OUT = [
+	"dev/static/chunks",
+	"static/chunks",
+	"dev/server",
+	"server"
+];
+/** The chunk each webpack module was last found in, by root and module id. */
+const located = /* @__PURE__ */ new Map();
+/**
+* A webpack module's own map. With eval-source-map (Next.js's webpack dev default, also for server components) each
+* module's code is a JSON string passed to eval, a script of its own with an inline map, and frame positions count from
+* its first line. The module is found in the chunks webpack writes to .next/ and rewrites when a module changes, so it
+* is read again for every lookup, from the chunk it was last found in first.
+*/
+function webpackMap(id, root, top) {
+	const out = path.join(root, ".next");
+	if (!inside(out, top)) return null;
+	const last = located.get(`${root}\0${id}`);
+	const chunks = new Set(last ? [last] : []);
+	for (const dir of WEBPACK_OUT.map((d) => path.join(out, d)).filter((d) => fs.existsSync(d))) for (const n of fs.readdirSync(dir, { recursive: true })) if (n.endsWith(".js") && !n.includes("vendor-chunks")) chunks.add(path.join(dir, n));
+	for (const file of chunks) {
+		let src;
+		try {
+			if (!inside(file, top)) continue;
+			src = fs.readFileSync(file, "utf8");
+		} catch {
+			continue;
+		}
+		const code = evalCode(src, id);
+		if (code === null) continue;
+		located.set(`${root}\0${id}`, file);
+		const ref = [...code.matchAll(/\/\/# sourceMappingURL=(data:\S+)/g)].at(-1)?.[1];
+		if (!ref) return null;
+		try {
+			const payload = JSON.parse(inline(ref));
+			return {
+				key: file,
+				map: new SourceMap(payload),
+				payload,
+				base: file,
+				code
+			};
+		} catch {
+			return null;
+		}
+	}
+	return null;
+}
+/**
+* The code webpack evals for module `id` in a chunk: the string after the module's key (`/***\/ "<id>":`), passed to
+* `eval(…)` or, with Trusted Types (Next.js's client chunks), `eval(__webpack_require__.ts(…))`. Null when the chunk
+* doesn't have the module, or doesn't eval it.
+*/
+function evalCode(src, id) {
+	const at = src.indexOf(`"${id}":`);
+	if (at < 0) return null;
+	const e = src.indexOf("eval(", at);
+	const q = src.indexOf("\"", e);
+	if (e < 0 || e - at > 2e3 || !/^eval\((?:[\w$.]+\()?$/.test(src.slice(e, q))) return null;
+	let i = q + 1;
+	while (i < src.length && src[i] !== "\"") i += src[i] === "\\" ? 2 : 1;
+	try {
+		return JSON.parse(src.slice(q, i + 1));
+	} catch {
+		return null;
+	}
+}
+/**
+* A map source to a path on disk: `file:///abs`, Turbopack's `[project]/x`, webpack's `webpack://_N_E/./x?hash` (Next.js
+* 14 and older; from 15 they are absolute paths), an absolute path, or relative to the chunk.
+*/
 function sourcePath(src, root, chunk) {
 	const s = decode(src).replace(/ \(.*\)$|%20.*$/, "");
 	const project = s.match(/\[project\]\/(.*)$/)?.[1];
 	if (project) return path.join(root, project);
+	const webpack = s.match(/^webpack:\/\/[^/]*\/([^?]*)/)?.[1];
+	if (webpack) return path.join(root, webpack);
 	if (s.startsWith("file://")) return fileURLToPath(s);
 	if (path.isAbsolute(s) && fs.existsSync(s)) return s;
 	if (/^https?:/.test(chunk)) {
@@ -2542,7 +2634,7 @@ function sourcePath(src, root, chunk) {
 * Nothing outside `scope` is read or fetched.
 */
 async function resolveFrame(f, root, scope = { top: root }) {
-	const loaded = await loadMap(f, scope);
+	const loaded = f.kind === "webpack" ? webpackMap(f.where, root, scope.top) : await loadMap(f, scope);
 	if (!loaded) return null;
 	let map = loaded.map;
 	let line = f.line;
@@ -3201,6 +3293,7 @@ function wrap(socket, forget) {
 			}
 		}
 	});
+	socket.on("end", () => socket.destroy());
 	socket.on("close", finish);
 	socket.on("error", finish);
 	return conn;
@@ -16818,6 +16911,7 @@ async function check(dir, url) {
 		else fail("The page has no stift script. Restart the dev server so next.config changes apply; the root layout must render <body>.");
 		if (/data-stift-src="/.test(html)) pass("Elements carry data-stift-src source locations.");
 		else fail("No data-stift-src attributes in the page: the loader rule did not run. Is the dev server running in development mode (next dev) with the next.config change?");
+		if (new URL(url).protocol === "https:") lines.push(`· The dev server runs on HTTPS and the overlay loads from the bridge at http://127.0.0.1:${port}: Safari blocks that as mixed content (Chrome and Firefox allow it). Comment from Chrome or Firefox, or run next dev over http to use Safari.`);
 	} else {
 		if (html.includes("/@stift/overlay.js")) pass("index.html loads the overlay.");
 		else fail("index.html has no stift script: restart the dev server so the Vite config change applies.");
@@ -16846,6 +16940,9 @@ async function check(dir, url) {
 			const r = await fetch(`http://127.0.0.1:${port}/overlay.js`).catch(() => null);
 			if (r?.ok) pass("The bridge serves the overlay.");
 			else fail(`The bridge does not serve /overlay.js (${r?.status ?? "no answer"}).`);
+		} else if (new URL(url).protocol === "https:") {
+			if (await (await devFetch(new URL("/@stift/bridge/bridge", url)).catch(() => null))?.json().then((j) => j.pid === bridge.pid, () => false)) pass("Vite forwards the bridge on the page's own origin, so the overlay connects over HTTPS (Safari blocks http://127.0.0.1 there).");
+			else fail(`Vite doesn't forward the bridge (/@stift/bridge/bridge), so on HTTPS Safari blocks the overlay's connection to ws://127.0.0.1:${port}. Run stift setup again to update the stift Vite plugin, and restart the dev server.`);
 		}
 		if (bridge.pages > 0) pass(`${bridge.pages} browser page(s) have the overlay connected.`);
 		else lines.push("· No browser page has connected to the bridge yet: open the app in a browser.");
@@ -16857,12 +16954,11 @@ async function check(dir, url) {
 }
 /** What stift loses without dev source maps; said with every source-map warning. */
 const LOSES = "Without them, server components and usage sites (where a component is rendered) lose their source location, and the agent has to search for them instead.";
-/** Config lines that turn dev source maps off, with the dev-only change to show the user. */
+/**
+* Config lines that turn dev source maps off, with the dev-only change to show the user. Not webpack's `devtool`:
+* `next dev` reverts changes to it.
+*/
 const OFF = [
-	{
-		re: /\bdevtool\s*[:=]\s*(false|['"]?(eval|hidden|nosources)[\w-]*['"]?)/,
-		fix: "Only set devtool for production builds: `if (!dev) config.devtool = …` in the webpack function (Next passes `{ dev }`)."
-	},
 	{
 		re: /\bserverSourceMaps\s*:\s*false/,
 		fix: "Keep server source maps in dev: `serverSourceMaps: process.env.NODE_ENV !== \"development\" ? false : true`, or remove the line."
@@ -16885,19 +16981,28 @@ const OFF = [
 	}
 ];
 /**
+* webpack's eval devtools (`next dev --webpack`: eval-source-map, for client and server) put no sourceMappingURL at the
+* end of a chunk: each module is eval'd from a string that ends in its own inline map. This is that map's comment as it
+* appears in the string (`\n` escaped). With devtool 'eval' (no maps) the strings end in a sourceURL only.
+*/
+const EVAL_MAP = /\\n\/\/# sourceMappingURL=data:application\/json/;
+/**
 * Whether the dev server really serves source maps: a client chunk from the page (and, for Next.js, the server bundles
-* in .next/) must end in a sourceMappingURL that resolves. Config lines that turn them off are named with the dev-only
-* change. Returns warning lines only: setup completes without source maps.
+* in .next/) must end in a sourceMappingURL that resolves, or eval its modules with inline maps (webpack). Config lines
+* that turn them off are named with the dev-only change. Returns warning lines only: setup completes without source maps.
 */
 async function sourceMaps(f, html, url) {
 	const problems = [];
 	const info = [];
+	let webpack = false;
 	const hasMap = async (chunk) => {
-		const ref = (await devFetch(chunk, {
+		const code = await devFetch(chunk, {
 			signal: AbortSignal.timeout(1e4),
 			origin: new URL(url).origin
-		}).then((r) => r.ok ? r.text() : "").catch(() => "")).match(/\/\/# sourceMappingURL=(\S+)\s*$/)?.[1];
-		if (!ref) return false;
+		}).then((r) => r.ok ? r.text() : "").catch(() => "");
+		if (/\bwebpackChunk/.test(code)) webpack = true;
+		const ref = code.match(/\/\/# sourceMappingURL=(\S+)\s*$/)?.[1];
+		if (!ref) return EVAL_MAP.test(code);
 		if (ref.startsWith("data:")) return true;
 		return devFetch(new URL(ref, chunk), {
 			signal: AbortSignal.timeout(1e4),
@@ -16911,9 +17016,13 @@ async function sourceMaps(f, html, url) {
 	if (noClient) problems.push(`The dev server serves client code without source maps (checked ${client.map((c) => new URL(c).pathname).join(", ")}).`);
 	let noServer = false;
 	if (f.name === "next") {
-		const bundles = [".next/dev/server/chunks/ssr", ".next/server/chunks/ssr"].map((d) => path.join(f.app, d)).filter((d) => fs.existsSync(d)).flatMap((d) => fs.readdirSync(d).filter((n) => n.endsWith(".js")).map((n) => path.join(d, n))).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs).slice(0, 5);
+		const bundles = (webpack ? [".next/dev/server/app", ".next/server/app"] : [".next/dev/server/chunks/ssr", ".next/server/chunks/ssr"]).map((d) => path.join(f.app, d)).filter((d) => fs.existsSync(d)).flatMap((d) => fs.readdirSync(d, { recursive: webpack }).filter((n) => n.endsWith(".js") && !n.endsWith("_client-reference-manifest.js")).map((n) => path.join(d, n))).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs).slice(0, 5);
 		if (!bundles.length) info.push("· No server bundles in .next/ yet to check (load a page first).");
-		noServer = bundles.length > 0 && !bundles.some((b) => /\/\/# sourceMappingURL=\S+\s*$/.test(fs.readFileSync(b, "utf8").slice(-400)) && fs.existsSync(`${b}.map`));
+		const mapped = (b) => {
+			const code = fs.readFileSync(b, "utf8");
+			return /\/\/# sourceMappingURL=\S+\s*$/.test(code.slice(-400)) && fs.existsSync(`${b}.map`) || EVAL_MAP.test(code);
+		};
+		noServer = bundles.length > 0 && !bundles.some(mapped);
 		if (noServer) problems.push("The server bundles in .next/ have no source maps.");
 	}
 	const files = [f.config, ...[
@@ -16930,13 +17039,14 @@ async function sourceMaps(f, html, url) {
 	if (!problems.length && !found.length) return [...info, "✓ Dev source maps are on (client chunks" + (f.name === "next" ? " and server bundles" : "") + ")."];
 	const out = [...info, ...problems.map((p) => `! ${p}`)];
 	if (found.length) out.push(`! Config that turns source maps off:\n${found.join("\n")}`);
-	else out.push(turnOn(f, noClient, noServer));
+	else out.push(turnOn(f, noClient, noServer, webpack));
 	out.push(`! ${LOSES} Show the user the change above and apply it only if they agree; setup is complete either way.`);
 	return out;
 }
 /** The config to add when the dev server serves no source maps and no config line turns them off. */
-function turnOn(f, client, server) {
+function turnOn(f, client, server, webpack) {
 	const file = f.config ? path.basename(f.config) : `${f.name}.config.ts`;
+	if (f.name === "next" && webpack) return `! With webpack, next dev adds source maps itself (eval-source-map, with a plugin) and reverts devtool changes: a webpack function in ${file}, or a plugin it adds, drops them in dev. Find it by removing plugins one at a time.`;
 	if (f.name === "next") {
 		const dev = "process.env.NODE_ENV === \"development\" || undefined";
 		return `! Add to the config object in ${file} (merge into experimental if it has one):\n    experimental: { ${[client && `turbopackSourceMaps: ${dev}`, server && `serverSourceMaps: ${dev}`].filter(Boolean).join(", ")} },`;

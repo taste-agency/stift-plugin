@@ -1219,6 +1219,8 @@ function decode(s) {
 *   at Hero (about://React/Prerender/file:///app/.next/…/chunk.js?id=%255Bproject%255D/src/hero.tsx+…?98:81:426)
 *   at Page (rsc://React/Server/file:///app/.next/…/chunk.js?7:3:9)
 *   at helper (http://localhost:3000/_next/static/chunks/x.js?id=%255Bproject%255D/src/lib.ts+…:12:11)   a hot-updated module
+*   at Hero (webpack-internal:///(app-pages-browser)/./app/hero.tsx:43:87)                   webpack, client module
+*   at Card (about://React/Server/webpack-internal:///(rsc)/./app/page.tsx?5:34:87)          webpack, server component
 */
 function parseFrame(line) {
 	const m = line.match(/^\s*at (?:async )?(?:(.+?) \((.+):(\d+):(\d+)\)|(.+):(\d+):(\d+))\s*$/);
@@ -1229,7 +1231,17 @@ function parseFrame(line) {
 		line: +(m[3] ?? m[6]),
 		column: +(m[4] ?? m[7])
 	};
+	const replayed = /^(about|rsc):\/\/React\//.test(loc);
 	loc = loc.replace(/^(about|rsc):\/\/React\/[^/]+\//, "");
+	if (loc.startsWith("webpack-internal:///")) {
+		const id = loc.slice(20);
+		return {
+			fn,
+			kind: "webpack",
+			where: replayed ? id.replace(/\?\d+$/, "") : id,
+			...pos
+		};
+	}
 	const q = loc.indexOf("?");
 	const module = (q < 0 ? "" : decode(loc.slice(q + 1))).match(/(?:^|[?&])id=(\[project\]\/[^\s+?&]+)/)?.[1];
 	if (/^https?:\/\//.test(loc)) return {
@@ -1310,10 +1322,8 @@ async function loadMap(f, scope) {
 		const ref = code.match(/\/\/# sourceMappingURL=(\S+)\s*$/)?.[1];
 		if (ref) {
 			let json;
-			if (ref.startsWith("data:")) {
-				const data = ref.slice(ref.indexOf(",") + 1);
-				json = /;base64,/.test(ref) ? Buffer.from(data, "base64").toString("utf8") : decodeURIComponent(data);
-			} else if (f.kind === "file") {
+			if (ref.startsWith("data:")) json = inline(ref);
+			else if (f.kind === "file") {
 				const file = path.join(path.dirname(f.where), decode(ref));
 				if (!inside(file, scope.top)) throw new Error("map outside the repository");
 				json = fs.readFileSync(file, "utf8");
@@ -1338,11 +1348,93 @@ async function loadMap(f, scope) {
 	if (fetched) fetchedAt.set(key, Date.now());
 	return loaded;
 }
-/** A map source to a path on disk: `file:///abs`, Turbopack's `[project]/x`, an absolute path, or relative to the chunk. */
+/** An inline map's JSON (`data:application/json;base64,…`). */
+function inline(ref) {
+	const data = ref.slice(ref.indexOf(",") + 1);
+	return /;base64,/.test(ref) ? Buffer.from(data, "base64").toString("utf8") : decodeURIComponent(data);
+}
+/**
+* Where `next dev --webpack` writes the chunks it serves, under .next/ (.next/dev/ from Next.js 16). Client chunks
+* first: a pages router module is in the server bundle too, compiled differently, and the browser ran the client's.
+* Vendor chunks hold node_modules only.
+*/
+const WEBPACK_OUT = [
+	"dev/static/chunks",
+	"static/chunks",
+	"dev/server",
+	"server"
+];
+/** The chunk each webpack module was last found in, by root and module id. */
+const located = /* @__PURE__ */ new Map();
+/**
+* A webpack module's own map. With eval-source-map (Next.js's webpack dev default, also for server components) each
+* module's code is a JSON string passed to eval, a script of its own with an inline map, and frame positions count from
+* its first line. The module is found in the chunks webpack writes to .next/ and rewrites when a module changes, so it
+* is read again for every lookup, from the chunk it was last found in first.
+*/
+function webpackMap(id, root, top) {
+	const out = path.join(root, ".next");
+	if (!inside(out, top)) return null;
+	const last = located.get(`${root}\0${id}`);
+	const chunks = new Set(last ? [last] : []);
+	for (const dir of WEBPACK_OUT.map((d) => path.join(out, d)).filter((d) => fs.existsSync(d))) for (const n of fs.readdirSync(dir, { recursive: true })) if (n.endsWith(".js") && !n.includes("vendor-chunks")) chunks.add(path.join(dir, n));
+	for (const file of chunks) {
+		let src;
+		try {
+			if (!inside(file, top)) continue;
+			src = fs.readFileSync(file, "utf8");
+		} catch {
+			continue;
+		}
+		const code = evalCode(src, id);
+		if (code === null) continue;
+		located.set(`${root}\0${id}`, file);
+		const ref = [...code.matchAll(/\/\/# sourceMappingURL=(data:\S+)/g)].at(-1)?.[1];
+		if (!ref) return null;
+		try {
+			const payload = JSON.parse(inline(ref));
+			return {
+				key: file,
+				map: new SourceMap(payload),
+				payload,
+				base: file,
+				code
+			};
+		} catch {
+			return null;
+		}
+	}
+	return null;
+}
+/**
+* The code webpack evals for module `id` in a chunk: the string after the module's key (`/***\/ "<id>":`), passed to
+* `eval(…)` or, with Trusted Types (Next.js's client chunks), `eval(__webpack_require__.ts(…))`. Null when the chunk
+* doesn't have the module, or doesn't eval it.
+*/
+function evalCode(src, id) {
+	const at = src.indexOf(`"${id}":`);
+	if (at < 0) return null;
+	const e = src.indexOf("eval(", at);
+	const q = src.indexOf("\"", e);
+	if (e < 0 || e - at > 2e3 || !/^eval\((?:[\w$.]+\()?$/.test(src.slice(e, q))) return null;
+	let i = q + 1;
+	while (i < src.length && src[i] !== "\"") i += src[i] === "\\" ? 2 : 1;
+	try {
+		return JSON.parse(src.slice(q, i + 1));
+	} catch {
+		return null;
+	}
+}
+/**
+* A map source to a path on disk: `file:///abs`, Turbopack's `[project]/x`, webpack's `webpack://_N_E/./x?hash` (Next.js
+* 14 and older; from 15 they are absolute paths), an absolute path, or relative to the chunk.
+*/
 function sourcePath(src, root, chunk) {
 	const s = decode(src).replace(/ \(.*\)$|%20.*$/, "");
 	const project = s.match(/\[project\]\/(.*)$/)?.[1];
 	if (project) return path.join(root, project);
+	const webpack = s.match(/^webpack:\/\/[^/]*\/([^?]*)/)?.[1];
+	if (webpack) return path.join(root, webpack);
 	if (s.startsWith("file://")) return fileURLToPath(s);
 	if (path.isAbsolute(s) && fs.existsSync(s)) return s;
 	if (/^https?:/.test(chunk)) {
@@ -1357,7 +1449,7 @@ function sourcePath(src, root, chunk) {
 * Nothing outside `scope` is read or fetched.
 */
 async function resolveFrame(f, root, scope = { top: root }) {
-	const loaded = await loadMap(f, scope);
+	const loaded = f.kind === "webpack" ? webpackMap(f.where, root, scope.top) : await loadMap(f, scope);
 	if (!loaded) return null;
 	let map = loaded.map;
 	let line = f.line;
@@ -3003,6 +3095,7 @@ function wrap(socket, forget) {
 			}
 		}
 	});
+	socket.on("end", () => socket.destroy());
 	socket.on("close", finish);
 	socket.on("error", finish);
 	return conn;

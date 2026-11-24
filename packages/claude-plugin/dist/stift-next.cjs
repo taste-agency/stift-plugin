@@ -148,9 +148,13 @@ function babelParser(root) {
   }
 }
 
-/** Loads the overlay from the bridge, retrying with backoff until a Claude Code session serves it. */
+/**
+ * Loads the overlay from the bridge, retrying with backoff until a Claude Code session serves it. On an https page
+ * Safari blocks the http://127.0.0.1 script as mixed content: the console says so once.
+ */
 function bootstrap(port, root) {
-  return `(function(){if(window.__stiftBoot)return;window.__stiftBoot=1;window.__stiftRoot=${JSON.stringify(root)};var d=2000;function load(){var s=document.createElement('script');s.src='http://127.0.0.1:${port}/overlay.js';s.onerror=function(){s.remove();setTimeout(load,d);d=Math.min(d*2,30000)};document.head.appendChild(s)}load()})()`
+  const warn = `[stift] Can't load the overlay from http://127.0.0.1:${port}. Safari blocks it on https pages (mixed content): use Chrome or Firefox, or run next dev over http. Elsewhere, no Claude Code session with stift runs in this repository yet.`
+  return `(function(){if(window.__stiftBoot)return;window.__stiftBoot=1;window.__stiftRoot=${JSON.stringify(root)};var d=2000,w=0;function load(){var s=document.createElement('script');s.src='http://127.0.0.1:${port}/overlay.js';s.onerror=function(){s.remove();if(location.protocol==='https:'&&!w++)console.warn(${JSON.stringify(warn)});setTimeout(load,d);d=Math.min(d*2,30000)};document.head.appendChild(s)}load()})()`
 }
 
 module.exports = loader
