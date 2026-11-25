@@ -17,6 +17,6 @@ Remove stift from this project: undo what `/stift:setup` and `/stift:start` adde
    - Exit 0: everything stift added is gone.
    - Exit 2: each `LEFT` line is something it didn't remove because that wasn't safe (for example a config edited by hand around stift's wrapper, or an integration the team committed). Don't make those edits yourself; pass them on to the user as it says.
 
-2. Show the user `git status --short`, and tell them in a few lines what was removed and, for every `LEFT` line, exactly what to remove by hand. Say that their commits, branches (the feature branches stift made too), pull requests and their own edits stay as they were, and that a running dev server reloads its config by itself.
+2. Show the user `git status --short`, and tell them in a few lines what was removed and, for every `LEFT` line, exactly what to remove by hand. Say that their commits, branches (the ones made for pull requests too), pull requests and their own edits stay as they were, and that a running dev server reloads its config by itself.
 
 3. End with: the stift plugin itself stays installed in Claude Code (it works in other projects, and `/stift:setup` adds stift here again). To uninstall it: `claude plugin uninstall stift@stift`. If this session runs stift-local (`claude --plugin-dir …`), nothing is installed for it: they just run `claude` instead.

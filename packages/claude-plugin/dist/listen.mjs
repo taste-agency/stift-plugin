@@ -50,21 +50,15 @@ function wakeText(w, withPrompt = false) {
 	const lines = w.lines.join("\n");
 	if (withPrompt) {
 		const parts = [`stift: while you worked, the browser sent this. Write these lines to the user verbatim first:\n${lines}`];
-		if (w.job?.kind === "summary") parts.push(`Then summarize the user's own edits, now, as the brief below says, and call report_summary. Then answer the user's message.\n\n${w.job.brief}`);
-		else if (w.job?.kind === "review") parts.push(`Then open or update the pull request for the feature branch, now, as the brief below says, and call report_review. Then answer the user's message.\n\n${w.job.brief}`);
+		if (w.job?.kind === "pr") parts.push(`Then make the pull request, now, as the brief below says, and call report_pull_request. Then answer the user's message.\n\n${w.job.brief}`);
 		else if (w.job?.kind === "error") parts.push(`Then fix the error below, now, as the brief says. Then answer the user's message.\n\n${w.job.brief}`);
 		else if (w.job) parts.push(`Then make ${w.job.kind === "fix" ? "the fix for " : ""}stift #${w.job.n} yourself, now, as the brief below says. Don't start a subagent. Then answer the user's message.\n\n${w.job.brief}`);
 		return parts.join("\n\n");
 	}
-	if (w.job?.kind === "summary") return [
-		`stift: summarize the user's own uncommitted edits, now, as the brief below says. Don't start a subagent, and don't write anything before or while you work.`,
+	if (w.job?.kind === "pr") return [
+		`stift: make the pull request the user asked for, now, as the brief below says. Don't start a subagent, and don't write anything before or while you work.`,
 		w.job.brief,
-		`When report_summary is called, end your turn by writing exactly these lines, verbatim, as your only text:\n${lines}`
-	].join("\n\n");
-	if (w.job?.kind === "review") return [
-		`stift: open or update the pull request for the user's feature branch, now, as the brief below says. Don't start a subagent, and don't write anything before or while you work.`,
-		w.job.brief,
-		`When report_review is called, end your turn by writing exactly these lines, verbatim, as your only text:\n${lines}`
+		`When report_pull_request is called, end your turn by writing exactly these lines, verbatim, as your only text:\n${lines}`
 	].join("\n\n");
 	if (w.job?.kind === "error") return [
 		`stift: the user asked you to fix an error stift showed in the browser, now, as the brief below says. Don't start a subagent.`,

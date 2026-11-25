@@ -1,6 +1,6 @@
 # Set up stift in this project
 
-You are a coding agent in the person's project. stift lets them comment on their running web app in the browser; each comment becomes a change made by a Claude Code session and a commit on their feature branch, and the newest can be undone. Set it up in this conversation, then tell them how to start. Don't ask questions you can answer yourself, never stop to ask for a restart or reload, and don't commit anything.
+You are a coding agent in the person's project. stift lets them comment on their running web app in the browser; each comment becomes a change made by a Claude Code session and a commit on the branch they have checked out, and any of them can be undone. Set it up in this conversation, then tell them how to start. Don't ask questions you can answer yourself, never stop to ask for a restart or reload, and don't commit anything.
 
 stift is an alpha, free to use by invitation. It sends usage data to the stift team, and with the person's yes also their comments and Claude's work on them: https://getstift.vercel.app/telemetry.md says what and how to turn it off.
 
@@ -57,8 +57,8 @@ In a few lines, with the app's URL:
 - Open the app in the browser. stift's bar sits at the bottom of the page. Press **E** (or **C**, or the pencil on the bar) for Edit mode, click any element, and write what should change. Double-click text to change it in place. **V** goes back to View mode, where the page works as usual.
 - This conversation now listens for their changes (step 4). Every change needs a listening Claude Code session: if they close it, they run `/stift:start` in a new conversation in this project. Changes they make while no session listens are collected (the bar says "Not connected"); when a session connects again, stift asks them whether to apply them.
 - The bar's change count opens the list of changes; click one to jump to it.
-- Each comment becomes a commit on their feature branch (a comment on the base branch starts one, named after it). Cmd+Z on the page or "undo the last change" in the session undoes the newest. Their own uncommitted edits stay uncommitted. The shelf on stift's bar lists their features; Review pushes the branch and opens or updates its pull request.
-- What changed in the project (`git status --short`): the `.stift/` folder and the config line are dev only; production builds don't include them. The integration stays local to their machine: `.stift/` is excluded in `.git/info/exclude`, the config edit stays an uncommitted change that rides along across branch switches, and stift never puts either into a comment commit, a Review push or a pull request.
+- Each comment becomes a commit on the branch they have checked out; stift never switches branches by itself, and the bar shows the branch and how far it is from its remote. Cmd+Z on the page or "undo the last change" in the session undoes the newest. Their own uncommitted edits stay uncommitted. **Publish** pushes the branch (never forced); its dropdown's **Pull request** moves the commits to a new branch, pushes it, and the session opens the pull request.
+- What changed in the project (`git status --short`): the `.stift/` folder and the config line are dev only; production builds don't include them. The integration stays local to their machine: `.stift/` is excluded in `.git/info/exclude`, the config edit stays an uncommitted change that rides along across branch switches, and stift never puts either into a comment commit, a push or a pull request.
 - To take stift out of the project again, they run `/stift:remove`: it undoes the config edit and removes `.stift/` and stift's local settings and state, and leaves their commits, branches and edits.
 
 ## 4. Start listening

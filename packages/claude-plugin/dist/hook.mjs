@@ -3,7 +3,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, spawnSync } from "node:child_process";
+import os from "node:os";
 // packages/claude-plugin/src/changes/git.ts
 var GitError = class extends Error {
 	args;
@@ -29,7 +31,9 @@ Object.assign(baseEnv, {
 	GIT_COMMITTER_EMAIL: "stift@localhost",
 	LC_ALL: "C"
 });
+new AsyncLocalStorage();
 function git(args, opts) {
+	opts.cwd, opts.input;
 	const env = {
 		...baseEnv,
 		...opts.index ? { GIT_INDEX_FILE: opts.index } : {},
@@ -54,19 +58,25 @@ function git(args, opts) {
 }
 /** `git`, without blocking the event loop. */
 function gitAsync(args, opts) {
+	try {
+		opts.cwd, opts.input;
+	} catch (e) {
+		return Promise.reject(e);
+	}
 	const env = {
 		...baseEnv,
 		...opts.index ? { GIT_INDEX_FILE: opts.index } : {},
 		...opts.env
 	};
 	return new Promise((resolve, reject) => {
-		execFile("git", args, {
+		const child = execFile("git", args, {
 			cwd: opts.cwd,
 			env,
 			encoding: "buffer",
-			maxBuffer: 1 << 30
+			maxBuffer: 1 << 30,
+			timeout: opts.timeout
 		}, (err, stdout, stderr) => {
-			const status = err ? typeof err.code === "number" ? err.code : -1 : 0;
+			const status = err ? typeof err.code === "number" ? err.code : err.killed ? 124 : -1 : 0;
 			if (err && status === -1) return reject(err);
 			if (status !== 0 && !opts.allowFail) return reject(new GitError(args, status, stderr.toString()));
 			resolve({
@@ -76,12 +86,30 @@ function gitAsync(args, opts) {
 				out: stdout.toString().replace(/\n$/, "")
 			});
 		});
+		if (opts.input !== void 0) child.stdin?.end(opts.input);
 	});
 }
 /** Splits NUL-terminated output (`-z`). */
 function splitZ(buf) {
 	return buf.toString().split("\0").filter(Boolean);
 }
+let version = null;
+/**
+* Whether the installed Git is `major.minor` or newer (read once): `git hook run` needs 2.36, `update-ref --stdin`'s
+* symref-update 2.46. Tests set it with `setGitVersion` to run the fallbacks.
+*/
+function gitAtLeast(major, minor) {
+	if (!version) {
+		const m = spawnSync("git", ["--version"], { env: baseEnv }).stdout?.toString().match(/(\d+)\.(\d+)/);
+		version = m ? [Number(m[1]), Number(m[2])] : [0, 0];
+	}
+	return version[0] > major || version[0] === major && version[1] >= minor;
+}
+/** The environment git commands get: the caller's GIT_* left out (see `baseEnv`). For hooks stift runs itself. */
+const gitEnv = (extra = {}) => ({
+	...baseEnv,
+	...extra
+});
 // packages/claude-plugin/src/changes/lock.ts
 const pause = new Int32Array(new SharedArrayBuffer(4));
 /** Blocks the thread. Hooks and the CLI are short-lived synchronous processes. */
@@ -441,6 +469,7 @@ var Changes = class Changes {
 	top;
 	gitDir;
 	dir;
+	/** The all-zero object id: as an old value, a ref update's "must not exist yet". */
 	zero;
 	depth = 0;
 	/**
@@ -558,15 +587,71 @@ var Changes = class Changes {
 		if (!this.head()) return "The repository has no commit yet.";
 		return null;
 	}
-	/** Whether a commit is on a remote-tracking branch (pushed). */
-	pushed(sha) {
+	/** Whether `ref` names an object. */
+	has(ref) {
 		return this.git([
-			"for-each-ref",
-			"--count=1",
-			"--contains",
-			sha,
-			"refs/remotes"
-		], { allowFail: true }).out !== "";
+			"rev-parse",
+			"-q",
+			"--verify",
+			`${ref}^{commit}`
+		], { allowFail: true }).status === 0;
+	}
+	/**
+	* The remote's default branch (`origin/HEAD`, else origin's main, master or trunk), as a remote-tracking ref such as
+	* refs/remotes/origin/main. Null without one.
+	*/
+	defaultRef() {
+		const head = this.git([
+			"symbolic-ref",
+			"-q",
+			"refs/remotes/origin/HEAD"
+		], { allowFail: true }).out;
+		if (head && this.has(head)) return head;
+		return [
+			"main",
+			"master",
+			"trunk"
+		].map((b) => `refs/remotes/origin/${b}`).find((r) => this.has(r)) ?? null;
+	}
+	/** The branch's upstream as a remote-tracking ref (refs/remotes/origin/feature), when it has one that exists. */
+	upstream(branch = this.branch()) {
+		if (!branch) return null;
+		const r = this.git([
+			"rev-parse",
+			"-q",
+			"--symbolic-full-name",
+			`${branch}@{upstream}`
+		], { allowFail: true });
+		return r.status === 0 && r.out.startsWith("refs/remotes/") && this.has(r.out) ? r.out : null;
+	}
+	/**
+	* Where the highlighted changes start: the branch's upstream, else the remote's default branch. The commits over it
+	* are the session's, the ones not on the remote yet (`changes`). Null without either.
+	*/
+	highlightBase() {
+		return this.upstream() ?? this.defaultRef();
+	}
+	/**
+	* Where undo and redo look back to: the remote's default branch, so a change pushed on a feature branch (or moved
+	* to a new one by Pull request) can still be undone, with a revert. On the default branch itself, or without a
+	* remote, null: the newest 100 commits on HEAD (docs/versioning.md).
+	*/
+	undoBase() {
+		const def = this.defaultRef();
+		return def && def !== `refs/remotes/origin/${this.branch()}` ? def : null;
+	}
+	/** How many commits HEAD has that `ref` doesn't, and the other way round. */
+	aheadBehind(ref) {
+		const [behind, ahead] = this.git([
+			"rev-list",
+			"--left-right",
+			"--count",
+			`${ref}...HEAD`
+		]).out.split(/\s+/).map(Number);
+		return {
+			ahead,
+			behind
+		};
 	}
 	/** The user's name and email for commits, from their Git config. */
 	identity() {
@@ -743,9 +828,10 @@ var Changes = class Changes {
 		}
 	}
 	/**
-	* Moves the branch checked out (`to`: a commit, or a new commit on HEAD with `message`) and gives the working tree
-	* and the user's index the change `a` → `b` of each file, 3-way, so the user's own edits stay. `tree`: whether the
-	* new commit's files get it too (a new commit), or are `to`'s as they are. Refuses, changing nothing, on a conflict.
+	* Adds a commit on HEAD with `message` and the change `a` → `b` of each file, and gives the working tree (unless
+	* `worktree` is false: it has the change already) and the user's index the same change, 3-way, so the user's own
+	* edits stay. The branch moves with a compare-and-swap. Refuses,
+	* changing nothing, on a conflict.
 	*/
 	move(a, b, to, o = {}) {
 		const branch = this.branch();
@@ -758,22 +844,22 @@ var Changes = class Changes {
 			if (m === "conflict") conflicts.push(p);
 			return m === "conflict" ? ours : m;
 		};
-		let target;
-		if ("commit" in to) target = to.commit;
-		else {
-			const headFiles = this.inTree(head, paths);
-			const files = new Map(paths.map((p) => [p, take(headFiles.get(p) ?? null, p)]));
-			if (conflicts.length) throw new ChangesError("CONFLICT", `Later changes conflict in ${conflicts.join(", ")}.`);
-			target = this.git([
-				"commit-tree",
-				"--no-gpg-sign",
-				"-p",
-				to.parent ?? head,
-				"-m",
-				to.message,
-				this.treeWith(head, files)
-			], { env: this.identity() }).out;
-		}
+		const headFiles = this.inTree(head, paths);
+		const files = new Map(paths.map((p) => [p, take(headFiles.get(p) ?? null, p)]));
+		if (conflicts.length) throw new ChangesError("CONFLICT", `Later changes conflict in ${conflicts.join(", ")}.`);
+		const tree = this.treeWith(head, files);
+		const target = this.git([
+			"commit-tree",
+			"--no-gpg-sign",
+			"-p",
+			head,
+			"-F",
+			"-",
+			tree
+		], {
+			env: this.identity(),
+			input: to.message
+		}).out;
 		const wt = o.worktree === false ? null : this.worktree(paths);
 		const nextWt = wt && new Map(paths.map((p) => [p, take(wt.get(p) ?? null, p)]));
 		if (conflicts.length) throw new ChangesError("CONFLICT", `Your edits conflict in ${conflicts.join(", ")}.`);
@@ -800,6 +886,132 @@ var Changes = class Changes {
 			input: this.indexInfo(nextIdx)
 		});
 		return target;
+	}
+	/**
+	* The repository's pre-commit and commit-msg hooks, as `git commit` runs them, for the commit `commitPending` would
+	* make of task `taskId` now, without blocking the event loop. The index they see is a private one holding exactly
+	* that commit (never the user's). As with `git commit`, what pre-commit stages for the commit's files (a formatter,
+	* lint-staged) goes into the commit (`files`), and commit-msg may edit the message; the Stift-Comment trailer is put
+	* back when it took it out. Null when there is nothing to commit; throws when a hook refuses. Takes stift's lock only
+	* to read the commit: the bridge runs one at a time and starts nothing else on the checkout meanwhile.
+	*/
+	async commitHooks(taskId) {
+		const ready = this.locked(() => {
+			const s = this.staged(taskId);
+			if (!s) return null;
+			const states = new Map(s.go.map((f) => [f.path, s.merged.get(f.path)]));
+			return {
+				message: s.message,
+				head: this.head(),
+				states,
+				tree: this.treeWith(this.head(), states)
+			};
+		});
+		if (!ready) return null;
+		const index = path.join(this.dir, `index.hook-${hash(taskId)}`);
+		const msgFile = path.join(this.dir, `COMMIT_EDITMSG-${hash(taskId)}`);
+		const env = {
+			...this.identity(),
+			GIT_INDEX_FILE: index,
+			GIT_EDITOR: ":",
+			GIT_LITERAL_PATHSPECS: "0"
+		};
+		const run = async (hook, args = []) => {
+			const r = await this.runHook(hook, args, env);
+			if (!r || r.status === 0) return;
+			const why = `${r.stderr}\n${r.out}`.trim().split("\n").find((l) => l.trim());
+			throw new ChangesError("HOOK", `The ${hook} hook refused the commit${why ? `: ${why.trim()}` : ""}.`);
+		};
+		try {
+			await gitAsync(["read-tree", ready.tree], {
+				cwd: this.top,
+				index
+			});
+			await run("pre-commit");
+			const after = new Map([...ready.states.keys()].map((p) => [p, null]));
+			for (const line of splitZ((await gitAsync([
+				"ls-files",
+				"-s",
+				"-z",
+				"--",
+				...ready.states.keys()
+			], {
+				cwd: this.top,
+				index
+			})).stdout)) {
+				const tab = line.indexOf("	");
+				const [mode, blob] = line.slice(0, tab).split(" ");
+				after.set(line.slice(tab + 1), {
+					blob,
+					mode
+				});
+			}
+			const files = new Map([...after].filter(([p, st]) => !same(st, ready.states.get(p) ?? null)));
+			fs.writeFileSync(msgFile, ready.message.endsWith("\n") ? ready.message : `${ready.message}\n`);
+			await run("commit-msg", [msgFile]);
+			let message = fs.readFileSync(msgFile, "utf8");
+			if (trailers(message).get("Stift-Comment") !== taskId) message = `${message.trimEnd()}\n${COMMENT_TRAILER}: ${taskId}\n`;
+			return {
+				message,
+				head: ready.head,
+				files
+			};
+		} finally {
+			fs.rmSync(index, { force: true });
+			fs.rmSync(msgFile, { force: true });
+		}
+	}
+	/** The repository's post-commit hook, after a commit stift made; its outcome doesn't matter, as with `git commit`. */
+	async postCommit() {
+		await this.runHook("post-commit", [], {
+			...this.identity(),
+			GIT_LITERAL_PATHSPECS: "0"
+		});
+	}
+	/**
+	* Runs hook `name`: `git hook run` from Git 2.36 on, else the hook file itself (core.hooksPath, else the repository's
+	* hooks folder), as older Git runs it. Null when there is no such hook.
+	*/
+	async runHook(name, args, env) {
+		if (gitAtLeast(2, 36)) return gitAsync([
+			"hook",
+			"run",
+			"--ignore-missing",
+			name,
+			...args.length ? ["--", ...args] : []
+		], {
+			cwd: this.top,
+			env,
+			allowFail: true
+		});
+		const custom = this.git(["config", "core.hooksPath"], { allowFail: true }).out;
+		const dir = custom ? path.resolve(this.top, custom.replace(/^~(?=\/)/, os.homedir())) : path.resolve(this.top, this.git([
+			"rev-parse",
+			"--git-path",
+			"hooks"
+		]).out);
+		const file = path.join(dir, name);
+		try {
+			fs.accessSync(file, fs.constants.X_OK);
+		} catch {
+			return null;
+		}
+		return new Promise((resolve) => {
+			execFile(file, args, {
+				cwd: this.top,
+				env: gitEnv(env),
+				encoding: "buffer",
+				maxBuffer: 1 << 30
+			}, (err, stdout, stderr) => {
+				const code = err?.code;
+				resolve({
+					status: err ? typeof code === "number" ? code : 1 : 0,
+					stdout,
+					stderr: stderr.toString(),
+					out: stdout.toString().replace(/\n$/, "")
+				});
+			});
+		});
 	}
 	taskDir(agentId) {
 		return path.join(this.dir, "tasks", hash(agentId));
@@ -1012,7 +1224,7 @@ var Changes = class Changes {
 	* The comment succeeded: its pending hunks become one commit on the branch checked out, with its message and trailer.
 	* Files whose hunks overlap the user's uncommitted edits can't be separated and stay uncommitted (`kept`).
 	*/
-	commitPending(taskId) {
+	commitPending(taskId, hooks) {
 		return this.locked(() => {
 			const p = this.pending(taskId);
 			if (!p) return {
@@ -1020,31 +1232,52 @@ var Changes = class Changes {
 				files: [],
 				kept: []
 			};
-			const all = p.files.map((f) => f.path);
 			if (this.blocked()) return {
 				commit: null,
 				files: [],
-				kept: all
+				kept: p.files.map((f) => f.path)
 			};
 			try {
-				const headFiles = this.inTree(this.head(), all);
-				const kept = p.files.filter((f) => this.merge(headFiles.get(f.path) ?? null, f.before, f.result) === "conflict").map((f) => f.path);
-				const go = p.files.filter((f) => !kept.includes(f.path));
-				if (!go.length) return {
+				const s = this.staged(taskId);
+				if (!s.go.length) return {
 					commit: null,
 					files: [],
-					kept
+					kept: s.kept
 				};
-				const message = `${COMMIT_PREFIX}${p.comment.message ?? `stift: ${p.comment.text ?? taskId}`}\n\n${COMMENT_TRAILER}: ${taskId}`;
+				const changed = hooks?.files ?? /* @__PURE__ */ new Map();
+				const atHead = changed.size && hooks.head === this.head() ? this.inTree(hooks.head, [...changed.keys()]) : null;
+				const a = new Map(s.go.map((f) => [f.path, changed.has(f.path) && atHead ? atHead.get(f.path) ?? null : f.before]));
+				const b = new Map(s.go.map((f) => [f.path, changed.has(f.path) ? changed.get(f.path) : f.result]));
 				return {
-					commit: this.move(new Map(go.map((f) => [f.path, f.before])), new Map(go.map((f) => [f.path, f.result])), { message }, { worktree: false }),
-					files: go.map((f) => f.path),
-					kept
+					commit: this.move(a, b, { message: hooks?.message ?? s.message }, { worktree: false }),
+					files: s.go.map((f) => f.path),
+					kept: s.kept
 				};
 			} finally {
 				fs.rmSync(this.pendingFile(taskId), { force: true });
 			}
 		});
+	}
+	/** Task `taskId`'s change won't be committed (a hook refused it): its edits stay in the working tree, uncommitted. */
+	forgetPending(taskId) {
+		this.locked(() => fs.rmSync(this.pendingFile(taskId), { force: true }));
+	}
+	/**
+	* What committing task `taskId` takes now: its files that merge cleanly onto HEAD (`go`, with their merged
+	* versions) and those that overlap later lines (`kept`), and its message. Null without a pending change or a branch.
+	*/
+	staged(taskId) {
+		const p = this.pending(taskId);
+		if (!p || this.blocked()) return null;
+		const all = p.files.map((f) => f.path);
+		const headFiles = this.inTree(this.head(), all);
+		const merged = new Map(p.files.map((f) => [f.path, this.merge(headFiles.get(f.path) ?? null, f.before, f.result)]));
+		return {
+			go: p.files.filter((f) => merged.get(f.path) !== "conflict"),
+			kept: p.files.filter((f) => merged.get(f.path) === "conflict").map((f) => f.path),
+			message: `${COMMIT_PREFIX}${p.comment.message ?? `stift: ${p.comment.text ?? taskId}`}\n\n${COMMENT_TRAILER}: ${taskId}`,
+			merged
+		};
 	}
 	/** The comment failed: its pending hunks leave the working tree (3-way, so the user's edits stay); nothing is committed. Returns files it couldn't take out. */
 	discardPending(taskId) {
@@ -1078,7 +1311,6 @@ var Changes = class Changes {
 	*/
 	history(base) {
 		const range = this.range(base, 100);
-		const onBase = range.length === 1;
 		const recs = this.git([
 			"-c",
 			"core.quotePath=false",
@@ -1121,7 +1353,7 @@ var Changes = class Changes {
 				entries.push(tg.entry);
 			}
 			if (!tg) {
-				if (!target && onBase && !parents.includes(" ")) entries.push({
+				if (!target && !parents.includes(" ")) entries.push({
 					sha,
 					subject,
 					comment: "",
@@ -1198,13 +1430,13 @@ var Changes = class Changes {
 			"HEAD"
 		];
 	}
-	/** Whether undo and redo (over `base`, as `undo`) have something to do now: the page's buttons and shortcuts. */
-	can(base) {
+	/** Whether undo and redo have something to do now: the page's buttons and shortcuts. */
+	can() {
 		if (this.blocked()) return {
 			undo: false,
 			redo: false
 		};
-		const h = this.history(base);
+		const h = this.history(this.undoBase());
 		return {
 			undo: !!h.undo,
 			redo: !!h.redo
@@ -1213,16 +1445,15 @@ var Changes = class Changes {
 	/**
 	* A row's undo or redo of change `sha` (an action of its own), or without `sha` Cmd+Z's or Cmd+Shift+Z's step through
 	* the history (`history`), over `base` when given. Adds a commit that reverts the change or applies it again; its
-	* hunks follow in the working tree (3-way, so the user's edits stay). Cmd+Shift+Z straight after Cmd+Z, or the other
-	* way round, drops that commit instead while it is HEAD and unpushed: the same tree, and the same history as before
-	* it. A change's own commit and a pushed commit are never dropped. Where later commits or the user's edits changed
-	* the same lines, it refuses and changes nothing. Returns the change, and whether it is now in.
+	* hunks follow in the working tree (3-way, so the user's edits stay). History only grows: no commit is ever dropped,
+	* pushed or not, so every step stays in the log (docs/versioning.md, decision A). Where later commits or the user's
+	* edits changed the same lines, it refuses and changes nothing. Returns the change, and whether it is now in.
 	*/
-	toggle(verb, base, sha) {
+	toggle(verb, sha) {
 		return this.locked(() => {
 			const why = this.blocked();
 			if (why) throw new ChangesError("NO_BRANCH", why);
-			const h = this.history(base);
+			const h = this.history(this.undoBase());
 			let act;
 			if (sha) {
 				const tg = this.toggleOf(h, sha);
@@ -1241,10 +1472,7 @@ var Changes = class Changes {
 			const after = this.inTree(change, paths);
 			const parent = this.inTree(`${change}^`, paths);
 			const [a, b] = on ? [parent, after] : [after, parent];
-			const head = this.head();
-			const last = tg.events.at(-1);
-			if (!sha && last.sha === head && last.shortcut && last.shortcut !== verb && !this.pushed(head)) this.move(a, b, { commit: this.git(["rev-parse", `${head}^`]).out });
-			else this.move(a, b, { message: `${on ? "Reapply" : "Revert"} "${subject}"\n\n${on ? REAPPLIES_TRAILER : REVERTS_TRAILER}: ${change}\n${CHANGE_TRAILER}: ${comment}${sha ? "" : `\n${SHORTCUT_TRAILER}: ${verb}`}` });
+			this.move(a, b, { message: `${on ? "Reapply" : "Revert"} "${subject}"\n\n${on ? REAPPLIES_TRAILER : REVERTS_TRAILER}: ${change}\n${CHANGE_TRAILER}: ${comment}${sha ? "" : `\n${SHORTCUT_TRAILER}: ${verb}`}` });
 			return {
 				sha: change,
 				subject,
@@ -1254,12 +1482,12 @@ var Changes = class Changes {
 		});
 	}
 	/** A row's undo of change `sha`, else Cmd+Z (`toggle`). */
-	undo(base, sha) {
-		return this.toggle("undo", base, sha);
+	undo(sha) {
+		return this.toggle("undo", sha);
 	}
 	/** A row's redo of undone change `sha`, else Cmd+Shift+Z (`toggle`). */
-	redo(sha, base) {
-		return this.toggle("redo", base, sha);
+	redo(sha) {
+		return this.toggle("redo", sha);
 	}
 	cached(key, fn) {
 		if (this.memo.has(key)) return this.memo.get(key);
@@ -1382,18 +1610,24 @@ var Changes = class Changes {
 		}
 	}
 	/**
-	* The change list (`history`), newest first, with each change's clash (`conflict`: why undoing it, or redoing it,
-	* clashes with later commits, so it is refused) and touches. `lazy`: clashes only `git merge-file` decides are left
-	* to `fillClashes`.
+	* The highlighted changes, newest first: the stift changes with a commit not on the remote yet (over
+	* `highlightBase`), so a pushed change shows again once it is undone or redone; and the other commits there, as
+	* `other`. Read from the history over `undoBase` (`history`), with each change's clash (`conflict`: why undoing it,
+	* or redoing it, clashes with later commits, so it is refused) and touches. `lazy`: clashes only `git merge-file`
+	* decides are left to `fillClashes`.
 	*/
-	changes(base, o = {}) {
-		const h = this.history(base);
+	changes(o = {}) {
+		const h = this.history(this.undoBase());
+		const hb = this.highlightBase();
+		const fresh = hb ? new Set(this.git(["rev-list", `${hb}..HEAD`], { allowFail: true }).out.split("\n").filter(Boolean)) : null;
+		const shown = (e) => e.other ? !!fresh?.has(e.sha) : !fresh || fresh.has(e.sha) || !!h.toggles.find((tg) => tg.entry === e)?.events.some((ev) => fresh.has(ev.sha));
 		if (h.undo && !h.undo.on) h.undo.tg.entry.undoNext = true;
 		if (h.redo?.on) h.redo.tg.entry.redoNext = true;
 		const head = this.head();
 		this.lazyClashes.clear();
-		if (head) this.annotate(h.toggles.map((tg) => tg.entry), head, !!o.lazy);
-		return h.entries;
+		const entries = h.entries.filter(shown);
+		if (head) this.annotate(entries.filter((e) => !e.other), head, !!o.lazy);
+		return entries;
 	}
 	/**
 	* Runs the clash checks the last lazy `changes` left out, with `git merge-file` in child processes (the event loop
@@ -1428,8 +1662,8 @@ var Changes = class Changes {
 	* Comment ids whose change is undone on the branch checked out (over `base`, as the change list), for the marks on the page. Reads only the log, not
 	* the change list's per-commit work.
 	*/
-	undone(base) {
-		return new Set(this.history(base).toggles.filter((tg) => tg.entry.undone).map((tg) => tg.entry.comment));
+	undone() {
+		return new Set(this.history(this.undoBase()).toggles.filter((tg) => tg.entry.undone).map((tg) => tg.entry.comment));
 	}
 };
 // packages/claude-plugin/src/protocol.ts

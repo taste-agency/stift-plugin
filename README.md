@@ -1,6 +1,6 @@
 # stift
 
-Comment on your running web app in the browser; each comment becomes a change made by your Claude Code session and a commit on your feature branch, and the newest can be undone. Alpha, free to use by invitation.
+Comment on your running web app in the browser; each comment becomes a change made by your Claude Code session and a commit on the branch you have checked out, and any of them can be undone. Alpha, free to use by invitation.
 
 This repository is the Claude Code marketplace for stift: the built plugin only. To set stift up in a project (React on Vite or Next.js), run this in the project:
 
