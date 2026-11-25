@@ -1678,8 +1678,11 @@ async function text(url) {
 	if (!r.ok) throw new Error(`${r.status} ${url}`);
 	return r.text();
 }
-/** The chunk's source map: inline, a sibling .map file, or fetched. Cached per chunk (by file mtime, or for a moment). */
-async function loadMap(f, scope) {
+/**
+* The chunk's source map: inline, a sibling .map file, or fetched. Cached per chunk (by file mtime, or for a moment);
+* `since`: a fetched one counts only when its fetch started at or after it.
+*/
+async function loadMap(f, scope, since = 0) {
 	let key = f.where;
 	if (f.kind === "file") {
 		if (!inside(f.where, scope.top)) return null;
@@ -1693,8 +1696,10 @@ async function loadMap(f, scope) {
 		if (!isLocal(u) || scope.origin && u.origin !== scope.origin) return null;
 	}
 	const fetched = f.kind === "http";
-	if (cache.has(key) && (!fetched || Date.now() - (fetchedAt.get(key) ?? 0) < FETCHED_TTL_MS)) return cache.get(key);
+	const at = fetchedAt.get(key) ?? 0;
+	if (cache.has(key) && (!fetched || Date.now() - at < FETCHED_TTL_MS && at >= since)) return cache.get(key);
 	let loaded = null;
+	const started = Date.now();
 	try {
 		const code = f.kind === "file" ? fs.readFileSync(f.where, "utf8") : await text(f.where);
 		const ref = code.match(/\/\/# sourceMappingURL=(\S+)\s*$/)?.[1];
@@ -1723,7 +1728,7 @@ async function loadMap(f, scope) {
 		if (fetched) return null;
 	}
 	cache.set(key, loaded);
-	if (fetched) fetchedAt.set(key, Date.now());
+	if (fetched) fetchedAt.set(key, started);
 	return loaded;
 }
 /** An inline map's JSON (`data:application/json;base64,…`). */
@@ -1744,20 +1749,32 @@ const WEBPACK_OUT = [
 ];
 /** The chunk each webpack module was last found in, by root and module id. */
 const located = /* @__PURE__ */ new Map();
+/** Each webpack module's map, by root and module id, while its chunk is unchanged (same modification time). */
+const webpackMaps = /* @__PURE__ */ new Map();
+const mtimeOf = (file) => {
+	try {
+		return fs.statSync(file).mtimeMs;
+	} catch {
+		return -1;
+	}
+};
 /**
 * A webpack module's own map. With eval-source-map (Next.js's webpack dev default, also for server components) each
 * module's code is a JSON string passed to eval, a script of its own with an inline map, and frame positions count from
 * its first line. The module is found in the chunks webpack writes to .next/ and rewrites when a module changes, so it
-* is read again for every lookup, from the chunk it was last found in first.
+* is read again once that chunk changed, from the chunk it was last found in first.
 */
 function webpackMap(id, root, top) {
 	const out = path.join(root, ".next");
 	if (!inside(out, top)) return null;
+	const known = webpackMaps.get(`${root}\0${id}`);
+	if (known && known.mtime >= 0 && mtimeOf(known.file) === known.mtime) return known.loaded;
 	const last = located.get(`${root}\0${id}`);
 	const chunks = new Set(last ? [last] : []);
 	for (const dir of WEBPACK_OUT.map((d) => path.join(out, d)).filter((d) => fs.existsSync(d))) for (const n of fs.readdirSync(dir, { recursive: true })) if (n.endsWith(".js") && !n.includes("vendor-chunks")) chunks.add(path.join(dir, n));
 	for (const file of chunks) {
 		let src;
+		const mtime = mtimeOf(file);
 		try {
 			if (!inside(file, top)) continue;
 			src = fs.readFileSync(file, "utf8");
@@ -1768,19 +1785,25 @@ function webpackMap(id, root, top) {
 		if (code === null) continue;
 		located.set(`${root}\0${id}`, file);
 		const ref = [...code.matchAll(/\/\/# sourceMappingURL=(data:\S+)/g)].at(-1)?.[1];
-		if (!ref) return null;
+		let loaded = null;
 		try {
-			const payload = JSON.parse(inline(ref));
-			return {
-				key: file,
-				map: new SourceMap(payload),
-				payload,
-				base: file,
-				code
-			};
-		} catch {
-			return null;
-		}
+			if (ref) {
+				const payload = JSON.parse(inline(ref));
+				loaded = {
+					key: file,
+					map: new SourceMap(payload),
+					payload,
+					base: file,
+					code
+				};
+			}
+		} catch {}
+		webpackMaps.set(`${root}\0${id}`, {
+			file,
+			mtime,
+			loaded
+		});
+		return loaded;
 	}
 	return null;
 }
@@ -1824,10 +1847,11 @@ function sourcePath(src, root, chunk) {
 /**
 * Maps a frame to its original source, or null when it can't be mapped or lands outside the app (node_modules,
 * React or Next.js). `root` is the dev server root: Turbopack's `[project]` and Vite's URLs are relative to it.
-* Nothing outside `scope` is read or fetched.
+* Nothing outside `scope` is read or fetched. `since`: a chunk fetched from the dev server before then is fetched
+* again (Turbopack serves a hot-updated chunk under the same URL, and the same frame then means another line).
 */
-async function resolveFrame(f, root, scope = { top: root }) {
-	const loaded = f.kind === "webpack" ? webpackMap(f.where, root, scope.top) : await loadMap(f, scope);
+async function resolveFrame(f, root, scope = { top: root }, since = 0) {
+	const loaded = f.kind === "webpack" ? webpackMap(f.where, root, scope.top) : await loadMap(f, scope, since);
 	if (!loaded) return null;
 	let map = loaded.map;
 	let line = f.line;
@@ -14414,7 +14438,6 @@ var PostHog = class extends PostHogBackendClient {
 	}
 };
 // packages/claude-plugin/src/telemetry.ts
-const HOST = process.env.STIFT_POSTHOG_HOST || "https://eu.i.posthog.com";
 /** Long text is cut to this many characters before it is sent. */
 const MAX_TEXT = 4e3;
 /** The person property setup stores the content answer in; the `stift-content` flag targets it. */
@@ -14426,6 +14449,27 @@ const STIFT_VERSION = (() => {
 		return "unknown";
 	}
 })();
+/** A stift checkout (bin/stift-local, `claude --plugin-dir`, tests) or a key other than the built-in one. */
+const isDev = (env = process.env) => !!env.STIFT_POSTHOG_KEY || fs.existsSync(fileURLToPath(new URL("../build.ts", import.meta.url)));
+/** A git email no person uses: reserved test domains (RFC 2606, 6761) and addresses without a real domain, such as u@x. */
+const isPlaceholderEmail = (email) => {
+	const domain = email.match(/^[^@\s]+@([^@\s]+)$/)?.[1];
+	return !domain || !domain.includes(".") || /(^|\.)(example\.(com|net|org)|example|test|invalid|localhost)$/i.test(domain);
+};
+/**
+* The agent that drives this run instead of a person, if any: Amp (its shells and the processes they start, Claude
+* Code included, inherit AMP_CURRENT_THREAD_ID and AGENT=amp), Claude Code without a person at it (`claude -p` sets
+* CLAUDE_CODE_ENTRYPOINT=sdk-cli, the Agent SDK sdk-ts or sdk-py, the GitHub Action claude-code-github-action), CI, or
+* a test harness's placeholder git email.
+*/
+function agentRun(env = process.env, email) {
+	if (env.AMP_CURRENT_THREAD_ID || env.AGENT === "amp" || env.AI_AGENT === "amp") return "amp";
+	const entry = env.CLAUDE_CODE_ENTRYPOINT;
+	if (entry?.startsWith("sdk-")) return "claude-code-sdk";
+	if (entry === "claude-code-github-action") return "claude-code-github-action";
+	if (/^(1|true)$/i.test(env.CI ?? "")) return "ci";
+	if (email !== void 0 && isPlaceholderEmail(email)) return "e2e";
+}
 function projectKey() {
 	if (process.env.STIFT_TELEMETRY === "0" || /^(1|true|yes)$/i.test(process.env.DO_NOT_TRACK ?? "")) return "";
 	return process.env.STIFT_POSTHOG_KEY || "phc_ApYdHArGcicYsYs9HcYtvqvNhcDmuxZAYNvxisSvrrng";
@@ -14446,9 +14490,52 @@ const git = (dir, key) => {
 		return;
 	}
 };
+/** stift's per-person files on this machine: the install ID and the answer to the content question. */
+const configFile = (name) => path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "stift", name);
+function readLocal() {
+	try {
+		const v = JSON.parse(fs.readFileSync(configFile("telemetry.json"), "utf8"));
+		return v && typeof v === "object" ? v : {};
+	} catch {
+		return {};
+	}
+}
+function writeLocal(patch) {
+	try {
+		const file = configFile("telemetry.json");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, `${JSON.stringify({
+			...readLocal(),
+			...patch
+		})}\n`);
+	} catch {}
+}
+/** The person's answer to the content question, on this machine: the hard gate for content. */
+function localContentAnswer() {
+	const v = readLocal()[CONTENT_PROPERTY];
+	return typeof v === "boolean" ? v : void 0;
+}
+/** What setContent's callers say when an agent drives the run and the answer isn't stored. */
+const AGENT_ANSWER = "Not stored: an agent drives this run (Amp, claude -p, the Agent SDK, CI or a test setup), and the content answer is the person's own. They can run `stift telemetry --content yes` (or no) in their own terminal.";
+/**
+* The content question for a session that starts listening, while this machine has no answer: for people who answered
+* before the answer was kept here, or who skipped it in setup. Asked once: handing it out records that it was asked,
+* so a skipped question doesn't come back. Never while telemetry is off, nor for a run an agent drives (no one to
+* answer). Without an answer no content is sent; nothing is inferred from the flag or the person property.
+*/
+function contentQuestion(dir, record, env = process.env) {
+	try {
+		const local = readLocal();
+		if (!projectKey() || typeof local["stift_share_content"] === "boolean" || local.content_asked_at || agentRun(env, identity(dir).email)) return "";
+		writeLocal({ content_asked_at: (/* @__PURE__ */ new Date()).toISOString() });
+	} catch {
+		return "";
+	}
+	return `Ask the user this question, with "Yes" as the first, preselected option: "Help improve stift by sharing what you ask for? stift would send your comment text, Claude's summaries and its tool calls, which can include code from this repository, to the stift team, who may use it to improve and train models. Usage and structure are sent either way. Details: https://getstift.vercel.app/telemetry.md" Options: "Yes, share it" and "No". Record the answer with ${record("true")} (or false for No). Ask it only this once; if the user skips it, don't ask again.`;
+}
 /** A random ID for this machine, for people without a git user.email. */
 function installId() {
-	const file = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "stift", "install-id");
+	const file = configFile("install-id");
 	try {
 		return fs.readFileSync(file, "utf8").trim();
 	} catch {}
@@ -14528,12 +14615,16 @@ var Telemetry = class {
 		content: false
 	};
 	flagsAt = 0;
+	/** The flags request in flight, which every refresh() waits for. */
+	reading = null;
 	base;
 	started = Date.now();
 	/** Events sent so far, by name (session_end reports them). Nothing is sent, not even the person, before the first event. */
 	counts = {};
 	dir;
-	constructor(dir, base = {}) {
+	dev = isDev();
+	/** `autocapture`: uncaught exceptions and unhandled rejections become `$exception` too (the long-lived bridge). */
+	constructor(dir, base = {}, { autocapture = false } = {}) {
 		this.dir = dir;
 		const key = projectKey();
 		this.base = {
@@ -14542,16 +14633,19 @@ var Telemetry = class {
 			arch: process.arch,
 			node: process.versions.node,
 			...key ? claudeFacts() : {},
+			...this.dev ? { stift_dev: true } : {},
 			...base
 		};
 		if (!key) return;
 		try {
 			this.ph = new PostHog(key, {
-				host: HOST,
+				host: process.env.STIFT_POSTHOG_HOST || "https://eu.i.posthog.com",
 				flushAt: 20,
 				flushInterval: 1e4,
 				requestTimeout: 3e3,
-				fetchRetryCount: 0
+				fetchRetryCount: 0,
+				enableExceptionAutocapture: autocapture,
+				beforeSend: (m) => m.event === "$exception" ? this.exception(m) : m
 			});
 			this.ph.on("error", () => {});
 		} catch {
@@ -14566,6 +14660,13 @@ var Telemetry = class {
 		if (this.id || !this.ph) return;
 		const who = identity(this.dir);
 		this.id = who.distinctId;
+		const agent = agentRun(process.env, who.email);
+		if (agent) this.base = {
+			...this.base,
+			stift_agent: true,
+			agent
+		};
+		const test = this.dev || !!agent;
 		this.ph.setPersonProperties({
 			distinctId: this.id,
 			properties: {
@@ -14574,22 +14675,61 @@ var Telemetry = class {
 				...claudeFacts(),
 				stift_version: STIFT_VERSION,
 				os: process.platform,
-				arch: process.arch
+				arch: process.arch,
+				...test ? { $internal_or_test_user: true } : {}
 			}
 		});
 	}
-	/** Reads the person's levels online (feature flags), at most every 10 minutes. */
-	async refresh() {
-		if (!this.ph || !this.id || Date.now() - this.flagsAt < 6e5) return this.levels;
+	/**
+	* Reads the person's levels online (feature flags), at most every 10 minutes. Content needs both the local yes and
+	* the flag; the local answer is also sent for the flag's evaluation, so a fresh answer isn't judged by the old one.
+	*/
+	refresh() {
+		if (this.reading) return this.reading;
+		const ph = this.ph;
+		if (!ph || !this.id || Date.now() - this.flagsAt < 6e5) return Promise.resolve(this.levels);
 		this.flagsAt = Date.now();
-		try {
-			const f = await this.ph.getAllFlags(this.id);
-			this.levels = {
-				structure: f["stift-structure"] !== false,
-				content: f["stift-content"] === true
-			};
-		} catch {}
-		return this.levels;
+		return this.reading = (async () => {
+			try {
+				const local = localContentAnswer();
+				const f = await ph.getAllFlags(this.id, local === void 0 ? {} : { personProperties: { [CONTENT_PROPERTY]: local } });
+				this.levels = {
+					structure: f["stift-structure"] !== false,
+					content: local === true && f["stift-content"] === true
+				};
+			} catch {}
+			this.reading = null;
+			return this.levels;
+		})();
+	}
+	/**
+	* Every `$exception` (from error() and autocapture) before it is sent: home paths and secrets scrubbed from its
+	* messages and stack frames, and an autocaptured one given the person and the common properties.
+	*/
+	exception(m) {
+		const props = { ...m.properties };
+		for (const k of Object.keys(props)) if (k.startsWith("$exception")) props[k] = scrubAll(props[k], 1e3);
+		if (props.where !== void 0) return {
+			...m,
+			properties: props
+		};
+		this.identify();
+		const { process_person_profile: _, ...options } = m.options ?? {};
+		return {
+			...m,
+			distinctId: this.id || m.distinctId,
+			options,
+			properties: {
+				...this.base,
+				...props,
+				where: "uncaught",
+				telemetry_level: this.level()
+			}
+		};
+	}
+	/** The level for an event now: a No given since the last refresh (in any stift process) stops content at once. */
+	level() {
+		return this.levels.content && localContentAnswer() === true ? "content" : this.levels.structure ? "structure" : "usage";
 	}
 	capture(event, e = {}) {
 		if (!this.ph) return;
@@ -14597,6 +14737,7 @@ var Telemetry = class {
 			this.identify();
 			this.refresh();
 			this.counts[event] = (this.counts[event] ?? 0) + 1;
+			const level = this.level();
 			const properties = {
 				...this.base,
 				...e.trace ? {
@@ -14605,8 +14746,8 @@ var Telemetry = class {
 				} : {},
 				...e.props,
 				...this.levels.structure ? e.structure : {},
-				...this.levels.content && e.content ? scrubAll(e.content) : {},
-				telemetry_level: this.levels.content ? "content" : this.levels.structure ? "structure" : "usage"
+				...level === "content" && e.content ? scrubAll(e.content) : {},
+				telemetry_level: level
 			};
 			this.ph.capture({
 				distinctId: this.id,
@@ -14615,30 +14756,48 @@ var Telemetry = class {
 			});
 		} catch {}
 	}
-	/** An error, with home paths stripped and secrets scrubbed. */
+	/** A failure, for Error Tracking (`$exception`), with where it happened; exception() scrubs it. */
 	error(e, where, trace) {
-		const err = e;
-		this.capture("error", {
-			trace,
-			props: {
-				where,
-				error: scrub(String(err?.message ?? e), 500),
-				error_type: err?.name,
-				stack: err?.stack ? scrub(err.stack.split("\n").slice(1, 6).join("\n"), 1e3) : void 0
-			}
-		});
-	}
-	/** Stores the person's answer to the content question from setup (the `stift-content` flag targets it). */
-	async setContent(share) {
 		if (!this.ph) return;
+		try {
+			this.identify();
+			this.refresh();
+			this.counts.$exception = (this.counts.$exception ?? 0) + 1;
+			this.ph.captureException(e, {
+				distinctId: this.id,
+				properties: {
+					...this.base,
+					...trace ? {
+						$ai_trace_id: trace,
+						stift_trace: trace
+					} : {},
+					where,
+					telemetry_level: this.level()
+				}
+			});
+		} catch {}
+	}
+	/**
+	* Stores the person's answer to the content question: on this machine (the hard gate) and as a person property (the
+	* `stift-content` flag targets it). Not in a run an agent drives, where the agent, not the person, would answer for
+	* the person's later sessions: returns false then.
+	*/
+	async setContent(share) {
+		if (agentRun(process.env, identity(this.dir).email)) return false;
+		writeLocal({ [CONTENT_PROPERTY]: share });
+		if (!this.ph) return true;
 		try {
 			this.identify();
 			this.ph.setPersonProperties({
 				distinctId: this.id,
 				properties: { [CONTENT_PROPERTY]: share }
 			});
+			await this.reading;
+			this.flagsAt = 0;
+			this.refresh();
 			this.capture("content_sharing_set", { props: { share } });
 		} catch {}
+		return true;
 	}
 	/** The session ended: how long it ran and what it did, when it sent anything at all. */
 	sessionEnd() {
@@ -14816,7 +14975,7 @@ var Bridge = class {
 		this.telemetry = new Telemetry(this.cl.top, {
 			stift_session: this.sessionId,
 			claude_session: opts.owner?.sessionId
-		});
+		}, { autocapture: true });
 	}
 	/** Whether this bridge serves the repository now: not before it bound the port, nor after another session took it. */
 	get serving() {
@@ -15220,7 +15379,35 @@ var Bridge = class {
 			else if (msg.type === "new-feature") this.requestSwitch(null, conn);
 			else if (msg.type === "switch-answer") this.answerSwitch(msg.answer, conn);
 			else if (msg.type === "fix") this.fixError(msg.error, conn);
+			else if (msg.type === "locate") this.locate(msg, conn);
 		};
+	}
+	/**
+	* Where components' elements were created (their `_debugStack`), for the change marks to find a changed usage line:
+	* each stack's creator frame mapped to its source, relative to the dev server root. Read-only, within the repository
+	* and the page's origin, as for a comment's owner stacks.
+	*/
+	async locate(msg, conn) {
+		const root = typeof msg.root === "string" && msg.root ? msg.root : this.cl.top;
+		const stacks = (Array.isArray(msg.stacks) ? msg.stacks : []).slice(0, 400);
+		const since = Date.now();
+		const locations = [];
+		for (const s of stacks) {
+			const frame = typeof s === "string" ? creatorFrame(s) : null;
+			const loc = frame && await resolveFrame(frame, root, {
+				top: this.cl.top,
+				origin: conn.origin
+			}, since).catch(() => null);
+			locations.push(loc ? {
+				file: path.relative(root, loc.file),
+				line: loc.line
+			} : null);
+		}
+		this.send({
+			type: "located",
+			key: String(msg.key),
+			locations
+		}, conn);
 	}
 	send(msg, to) {
 		const text = JSON.stringify(msg);
@@ -16691,7 +16878,7 @@ const tools = (bridge) => {
 			},
 			async run() {
 				if (await bridge.arm()) return "Already listening; listening goes on by itself. End your turn now with no text.";
-				const ask = autoUpdateQuestion((on) => `the set_auto_update tool ({"on": ${on}})`);
+				const ask = [autoUpdateQuestion((on) => `the set_auto_update tool ({"on": ${on}})`), contentQuestion(bridge.cl.top, (share) => `the set_content_sharing tool ({"share": ${share}})`)].filter(Boolean).join(" ");
 				return `Listening for stift comments.${ask && ` ${ask}`} Say "Listening for comments from the browser." to the user and end your turn: stift wakes this session with each comment.`;
 			}
 		},
@@ -16705,6 +16892,20 @@ const tools = (bridge) => {
 				additionalProperties: false
 			},
 			run: async (a) => setAutoUpdate(a.on === true)
+		},
+		{
+			name: "set_content_sharing",
+			description: "Record the user's answer to stift's content question: whether stift sends comment text, Claude's summaries and tool calls (which can include code) to the stift team.",
+			inputSchema: {
+				type: "object",
+				properties: { share: { type: "boolean" } },
+				required: ["share"],
+				additionalProperties: false
+			},
+			async run(a) {
+				if (!await bridge.telemetry.setContent(a.share === true)) return AGENT_ANSWER;
+				return a.share === true ? "✓ Sharing comment text, Claude's summaries and its tool calls with the stift team." : "✓ Not sharing content; only usage and structure are sent.";
+			}
 		},
 		{
 			name: "stop_listening",
