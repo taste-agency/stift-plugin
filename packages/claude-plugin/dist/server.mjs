@@ -15806,7 +15806,7 @@ var Bridge = class {
 		c.record.status = status;
 		c.record.message = message;
 		this.persist(c);
-		const { files, notes, ahead } = c.record;
+		const { files, notes, ahead, interpreted } = c.record;
 		this.send({
 			type: "status",
 			id: c.record.payload.id,
@@ -15815,7 +15815,8 @@ var Bridge = class {
 			files,
 			notes,
 			ahead,
-			held: c.record.held ?? false
+			held: c.record.held ?? false,
+			interpreted
 		});
 	}
 	/**
@@ -16681,6 +16682,34 @@ var Bridge = class {
 		this.settle(c, status === "done" ? "applied" : "failed", message);
 		return `${id} is ${status}.`;
 	}
+	/**
+	* report_interpretation: the phrases of the comment being worked on that the session turned into values. Kept with
+	* the comment and sent with its outcome; the page reopens the prompt on it when one was a judgement call. Only
+	* phrases the comment has, on a CSS property, are kept: the page puts a chip on each.
+	*/
+	interpret(id, list) {
+		const c = this.comments.get(id);
+		if (!c) throw new Error(`No comment ${id}.`);
+		if (id !== this.activeId || c.phase !== "working") throw new Error(`${id} isn't the comment being worked on now.`);
+		const text = c.record.payload.text.toLowerCase();
+		const kept = [];
+		for (const x of Array.isArray(list) ? list.slice(0, 8) : []) {
+			const phrase = typeof x?.phrase === "string" ? x.phrase.trim() : "";
+			const prop = typeof x?.property === "string" ? x.property.trim().toLowerCase() : "";
+			const value = typeof x?.value === "string" ? x.value.trim().slice(0, 120) : "";
+			if (!phrase || !text.includes(phrase.toLowerCase()) || !/^[a-z]+(-[a-z]+)*$/.test(prop) || !value) continue;
+			kept.push({
+				phrase,
+				prop,
+				value,
+				judged: x.judgement === true
+			});
+		}
+		c.record.interpreted = kept;
+		this.persist(c);
+		const judged = kept.filter((k) => k.judged).length;
+		return kept.length ? `Noted ${kept.length} phrase${kept.length > 1 ? "s" : ""} (${judged} judgement call${judged === 1 ? "" : "s"}). Finish the change and end your turn as usual.` : "Nothing kept: each phrase must be words of the comment, with a CSS property and its value.";
+	}
 	setListening(on) {
 		if (on === this.listening) return;
 		this.listening = on;
@@ -17031,7 +17060,8 @@ function commentPrompt(p, attached) {
 	return `Comment on the running app: ${JSON.stringify(p.text)}
 Where: ${where(p.target)}${attachedLine(attached, p.id)}${p.styles?.length ? `
 With it, the user restyled the element with stift's edit controls (the page shows it already). Write these too, in the project's own way (${p.system === "tailwind" ? "Tailwind utilities in its class list" : "its stylesheet"}, with the design tokens named), to this element only, unless the comment says otherwise:
-${pageData(styleLines(p.styles))}` : ""}
+${pageData(styleLines(p.styles))}` : ""}${p.interpret ? `
+When you turn vague words of the comment into values by judgement ("a bit larger" → 20px, "red" → a colour token), call report_interpretation with id ${JSON.stringify(p.id)} before you end your turn: each phrase as the comment words it, the CSS property it set on this element and its value, and whether it was a judgement call. Skip it when the comment named every value exactly ("padding 16px", "use --color-primary").` : ""}
 
 ${RULES(p.id)}`;
 }
@@ -17347,6 +17377,53 @@ const tools = (bridge) => {
 				additionalProperties: false
 			},
 			run: served(async (a) => bridge.report(a.id, a.status, a.message))
+		},
+		{
+			name: "report_interpretation",
+			description: "For a stift comment whose brief asks for it: the phrases you turned into values. stift reopens the prompt on the element with each phrase as a control showing its value, so the user can tweak your judgement calls without another prompt. Call it in the comment's turn, only when at least one value was a judgement call.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					id: {
+						type: "string",
+						description: "Comment id, such as c_m3x1k2."
+					},
+					phrases: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: {
+								phrase: {
+									type: "string",
+									description: "The words of the comment, exactly as written, such as \"a bit larger\"."
+								},
+								property: {
+									type: "string",
+									description: "The CSS property it set on the element, such as font-size."
+								},
+								value: {
+									type: "string",
+									description: "The value you chose, as written: 20px, var(--color-red), #e03131."
+								},
+								judgement: {
+									type: "boolean",
+									description: "true when the comment left the value to you; false when it named it."
+								}
+							},
+							required: [
+								"phrase",
+								"property",
+								"value",
+								"judgement"
+							],
+							additionalProperties: false
+						}
+					}
+				},
+				required: ["id", "phrases"],
+				additionalProperties: false
+			},
+			run: served(async (a) => bridge.interpret(a.id, a.phrases))
 		},
 		{
 			name: "place_attachment",
