@@ -436,7 +436,7 @@ var ChangesError = class extends Error {
 	}
 };
 const hash = (s) => crypto.createHash("sha1").update(s).digest("hex").slice(0, 20);
-const same = (a, b) => a && b ? a.blob === b.blob && a.mode === b.mode : a === b;
+const same$1 = (a, b) => a && b ? a.blob === b.blob && a.mode === b.mode : a === b;
 function readJson$1(file) {
 	try {
 		return JSON.parse(fs.readFileSync(file, "utf8"));
@@ -733,8 +733,8 @@ var Changes = class Changes {
 	}
 	/** A 3-way merge decided without merging texts, or `undefined` when only `git merge-file` can tell. */
 	quickMerge(ours, base, theirs) {
-		if (same(ours, base)) return theirs;
-		if (same(base, theirs) || same(ours, theirs)) return ours;
+		if (same$1(ours, base)) return theirs;
+		if (same$1(base, theirs) || same$1(ours, theirs)) return ours;
 		if (!ours || !base || !theirs) return "conflict";
 	}
 	/** 3-way merge of file states: `ours` plus the change from `base` to `theirs`. */
@@ -866,7 +866,7 @@ var Changes = class Changes {
 			target,
 			head
 		], { allowFail: true }).status !== 0) throw new ChangesError("MOVED", `${branch} moved meanwhile; nothing was changed.`);
-		if (nextWt) this.writeWorktree(new Map([...nextWt].filter(([p, s]) => !same(s, wt.get(p) ?? null))));
+		if (nextWt) this.writeWorktree(new Map([...nextWt].filter(([p, s]) => !same$1(s, wt.get(p) ?? null))));
 		this.git([
 			"update-index",
 			"-z",
@@ -936,7 +936,7 @@ var Changes = class Changes {
 					mode
 				});
 			}
-			const files = new Map([...after].filter(([p, st]) => !same(st, ready.states.get(p) ?? null)));
+			const files = new Map([...after].filter(([p, st]) => !same$1(st, ready.states.get(p) ?? null)));
 			fs.writeFileSync(msgFile, ready.message.endsWith("\n") ? ready.message : `${ready.message}\n`);
 			await run("commit-msg", [msgFile]);
 			let message = fs.readFileSync(msgFile, "utf8");
@@ -1190,7 +1190,7 @@ var Changes = class Changes {
 						result: t.result
 					});
 				}
-				const changed = [...files.values()].filter((f) => !same(f.before, f.result)).sort((x, y) => x.path < y.path ? -1 : 1);
+				const changed = [...files.values()].filter((f) => !same$1(f.before, f.result)).sort((x, y) => x.path < y.path ? -1 : 1);
 				fs.mkdirSync(path.join(this.dir, "pending"), { recursive: true });
 				if (changed.length) writeJson(this.pendingFile(task.taskId), {
 					taskId: task.taskId,
@@ -1280,7 +1280,7 @@ var Changes = class Changes {
 			for (const f of p.files) {
 				const m = this.merge(now.get(f.path) ?? null, f.result, f.before);
 				if (m === "conflict") stuck.push(f.path);
-				else if (!same(m, now.get(f.path) ?? null)) back.set(f.path, m);
+				else if (!same$1(m, now.get(f.path) ?? null)) back.set(f.path, m);
 			}
 			this.writeWorktree(back);
 			fs.rmSync(this.pendingFile(taskId), { force: true });
@@ -2649,6 +2649,153 @@ function commitMessage(w, c) {
 	const prefix = w.commitStyle.conventional ? `${w.commitStyle.type ?? "chore"}: ` : "";
 	return `${oneLine(prefix + what(c), 72)}\n\nMade with stift from a comment on the running app.`;
 }
+const TAGS = {
+	bold: "strong",
+	italic: "em"
+};
+/** One mark per UTF-16 unit, as strings and DOM offsets count. */
+const fill = (text, mark) => new Array(text.length).fill(mark);
+const doc = (text = "", mark = 0) => ({
+	text,
+	marks: fill(text, mark)
+});
+/** `d` with [start, end) replaced by `text`, every character of it marked `mark`. */
+function replace(d, start, end, text, mark) {
+	return {
+		text: d.text.slice(0, start) + text + d.text.slice(end),
+		marks: [
+			...d.marks.slice(0, start),
+			...fill(text, mark),
+			...d.marks.slice(end)
+		]
+	};
+}
+/** Runs of the same marks, in order. */
+function runs(d) {
+	const out = [];
+	for (let i = 0; i < d.text.length; i++) {
+		const last = out.at(-1);
+		if (last && last.marks === d.marks[i]) last.text += d.text[i];
+		else out.push({
+			text: d.text[i],
+			marks: d.marks[i]
+		});
+	}
+	return out;
+}
+/**
+* The document as the page shows it: each run of spaces one space, none at the ends of a line or of the text. A space
+* takes the marks of the first space of its run.
+*/
+function normalize(d) {
+	let text = "";
+	const marks = [];
+	for (let i = 0; i < d.text.length; i++) {
+		const c = d.text[i];
+		if (c !== "\n" && /\s/.test(c)) {
+			if (text && !/[ \n]$/.test(text)) text += " ", marks.push(d.marks[i]);
+			continue;
+		}
+		if (c === "\n" && text.endsWith(" ")) text = text.slice(0, -1), marks.pop();
+		text += c;
+		marks.push(c === "\n" ? 0 : d.marks[i]);
+	}
+	if (text.endsWith(" ")) text = text.slice(0, -1), marks.pop();
+	return {
+		text,
+		marks
+	};
+}
+/** The same text with the same marks on every visible character (marks on spaces don't show). */
+function same(a, b) {
+	const x = normalize(a), y = normalize(b);
+	return x.text === y.text && x.marks.every((m, i) => m === y.marks[i] || /\s/.test(x.text[i]));
+}
+/** Characters JSX text can't hold as they are: they would start a tag, an expression or an entity, or not parse. */
+const ESCAPE = /[<>{}&]/;
+/** One line of text as JSX children: as it is, or as a string literal when it has characters JSX text can't hold. */
+const jsxLine = (t) => ESCAPE.test(t) ? `{${JSON.stringify(t)}}` : t;
+/** The document as JSX children, on one line: `Ship your <strong>app</strong> faster`. */
+function toMarkup(d, tags = TAGS) {
+	const open = [];
+	const tag = (bit) => bit === 1 ? tags.bold : tags.italic;
+	let out = "";
+	const rs = runs(d);
+	for (const [n, r] of rs.entries()) {
+		const want = /^\n+$/.test(r.text) ? open.reduce((a, b) => a | b, 0) & (rs[n + 1]?.marks ?? 0) : r.marks;
+		while (open.some((b) => !(want & b))) out += `</${tag(open.pop())}>`;
+		for (const bit of [1, 2]) if (want & bit && !open.includes(bit)) open.push(bit), out += `<${tag(bit)}>`;
+		out += r.text.split("\n").map(jsxLine).join("<br />");
+	}
+	while (open.length) out += `</${tag(open.pop())}>`;
+	return out;
+}
+const MARK = {
+	strong: 1,
+	b: 1,
+	em: 2,
+	i: 2
+};
+/**
+* JSX children in this editor's subset as a document, with the tags they use; null for anything else. Text follows
+* JSX's whitespace rules: a line break and the indentation around it go, and lines join with one space.
+*/
+function parseMarkup(src) {
+	let d = doc();
+	const tags = {};
+	const stack = [];
+	const mark = () => stack.reduce((m, t) => m | MARK[t], 0);
+	let i = 0;
+	while (i < src.length) if (src[i] === "<") {
+		const m = /^<(\/?)([a-z]+)\s*(\/?)>/.exec(src.slice(i));
+		if (!m) return null;
+		const [all, close, name, self] = m;
+		if (name === "br") {
+			if (close) return null;
+			d = replace(d, d.text.length, d.text.length, "\n", 0);
+		} else if (name in MARK && !self) {
+			if (close) {
+				if (stack.pop() !== name) return null;
+			} else {
+				stack.push(name);
+				if (MARK[name] === 1) tags.bold ??= name;
+				else tags.italic ??= name;
+			}
+		} else return null;
+		i += all.length;
+	} else if (src[i] === "{") {
+		const m = /^\{\s*(?:'([^'\\\n]*)'|("(?:[^"\\\n]|\\["\\/bfnrtu])*"))\s*\}/.exec(src.slice(i));
+		if (!m) return null;
+		let lit = m[1];
+		if (lit === void 0) try {
+			lit = JSON.parse(m[2]);
+		} catch {
+			return null;
+		}
+		d = replace(d, d.text.length, d.text.length, lit, mark());
+		i += m[0].length;
+	} else {
+		const end = src.slice(i).search(/[<{]/);
+		const raw = end < 0 ? src.slice(i) : src.slice(i, i + end);
+		if (/[>}&]/.test(raw)) return null;
+		const text = jsxText(raw);
+		d = replace(d, d.text.length, d.text.length, text, mark());
+		i += raw.length;
+	}
+	return stack.length ? null : {
+		doc: d,
+		tags: {
+			...TAGS,
+			...tags
+		}
+	};
+}
+/** JSX text as React renders it: lines trimmed where they meet a line break, empty ones dropped, joined by a space. */
+function jsxText(raw) {
+	const lines = raw.split(/\r\n|\n|\r/);
+	if (lines.length === 1) return raw;
+	return lines.map((l, n) => n > 0 ? l.replace(/^[ \t]+/, "") : l).map((l, n) => n < lines.length - 1 ? l.replace(/[ \t]+$/, "") : l).filter(Boolean).join(" ");
+}
 const EXTS = [
 	".tsx",
 	".ts",
@@ -2736,6 +2883,112 @@ function applyTextEdit(cl, e) {
 	};
 	const c = found[0];
 	return write(cl, e, c.file, files.length, (text) => text.slice(c.run[0], c.run[1]) === c.runText ? text.slice(0, c.at) + c.insert + text.slice(c.at + c.length) : null);
+}
+/**
+* A text edited with bold, italic or line breaks (or characters JSX text can't hold): the element's own children, at
+* its stamp (`file:line:column` of its opening tag), are rewritten. Only when they are plain text, bold, italic and
+* line breaks (richText.ts `parseMarkup`) and show the same text as the page did (`was`); anything else goes to the
+* session and nothing is written. The new children are rendered here from the parsed edit, in the tags the source
+* already uses, so the only markup ever written is those tags and <br />; text that looks like code becomes a string
+* literal.
+*/
+function applyMarkupEdit(cl, e) {
+	const was = parseMarkup(e.was);
+	const to = parseMarkup(e.markup);
+	if (!was || !to) return {
+		ok: false,
+		reason: "the edit is not only text, bold, italic and line breaks",
+		searched: 0
+	};
+	const named = path.resolve(cl.top, e.file);
+	const file = fs.existsSync(named) ? fs.realpathSync(named) : null;
+	if (!file || !cl.editable([file]).size) return {
+		ok: false,
+		reason: "no source file for the element",
+		searched: 0
+	};
+	const rewrite = (text) => {
+		const at = offsetAt(text, e.line, e.column);
+		if (at === null || e.tag && !new RegExp(`^<${e.tag}[\\s/>]`).test(text.slice(at))) return { reason: "the element is not at its source location" };
+		const span = childrenOf(text, at);
+		if (!span) return { reason: "the element is not at its source location" };
+		const children = text.slice(span[0], span[1]);
+		const src = parseMarkup(children);
+		if (!src) return { reason: "the element's text in the source is more than text, bold, italic and line breaks" };
+		if (!same(src.doc, was.doc)) return { reason: "the source text differs from the page" };
+		const keep = (w) => w.includes("\n") ? w : "";
+		const lead = keep(/^\s*/.exec(children)[0]);
+		const trail = keep(/\s*$/.exec(children)[0]);
+		return { text: text.slice(0, span[0]) + lead + toMarkup(normalize(to.doc), src.tags) + trail + text.slice(span[1]) };
+	};
+	const first = rewrite(fs.readFileSync(file, "utf8"));
+	if ("reason" in first) return {
+		ok: false,
+		reason: first.reason,
+		searched: 1
+	};
+	return write(cl, e, file, 1, (text) => {
+		const r = rewrite(text);
+		return "text" in r ? r.text : null;
+	});
+}
+/** The offset of 1-based `line` and `column` in `text`, or null past its end. */
+function offsetAt(text, line, column) {
+	let at = 0;
+	for (let n = 1; n < line; n++) {
+		const nl = text.indexOf("\n", at);
+		if (nl < 0) return null;
+		at = nl + 1;
+	}
+	at += column - 1;
+	return at < text.length ? at : null;
+}
+/**
+* The span of a JSX element's children, from the `<` of its opening tag: after its `>`, up to its first `</tag>`.
+* Braces (with the strings in them) are skipped. A nested element of the same name ends the span early, and the
+* children then don't parse: refused, never misread.
+*/
+function childrenOf(text, at) {
+	const name = /^<([a-z][\w.-]*)/.exec(text.slice(at, at + 100))?.[1];
+	if (!name) return null;
+	let i = at + 1 + name.length;
+	for (;;) {
+		const c = text[i];
+		if (c === void 0) return null;
+		if (c === "\"" || c === "'") {
+			const j = text.indexOf(c, i + 1);
+			if (j < 0) return null;
+			i = j + 1;
+		} else if (c === "{") {
+			i = skipBraces(text, i);
+			if (i < 0) return null;
+		} else if (c === "/" && text[i + 1] === ">") return null;
+		else if (c === ">") break;
+		else i++;
+	}
+	const start = i + 1;
+	const close = new RegExp(`^</${name.replace(/[.]/g, "\\.")}\\s*>`);
+	for (i = start; i < text.length;) if (text[i] === "{") {
+		i = skipBraces(text, i);
+		if (i < 0) return null;
+	} else if (text[i] === "<" && close.test(text.slice(i, i + name.length + 20))) return [start, i];
+	else i++;
+	return null;
+}
+/** The index after the `}` that closes the `{` at `i`, or -1. */
+function skipBraces(text, i) {
+	let depth = 0;
+	for (; i < text.length; i++) {
+		const c = text[i];
+		if (c === "\"" || c === "'" || c === "`") {
+			let j = i + 1;
+			while (j < text.length && text[j] !== c) j += text[j] === "\\" ? 2 : 1;
+			if (j >= text.length) return -1;
+			i = j;
+		} else if (c === "{") depth++;
+		else if (c === "}" && --depth === 0) return i + 1;
+	}
+	return -1;
 }
 /** Writes one file as the comment's change, through the same path as the session's edits. */
 function write(cl, e, file, searched, edit) {
@@ -2967,6 +3220,542 @@ function jsonc(text) {
 		else out += c;
 	}
 	return out.replace(/,(\s*[}\]])/g, "$1");
+}
+// packages/claude-plugin/src/style-edit.ts
+/** A standard CSS property: lower-case words with dashes. Custom properties and vendor prefixes go to the session. */
+const PROP = /^[a-z]+(-[a-z]+)*$/;
+/** A value that could end a declaration or a string: never written. */
+const UNSAFE_VALUE = /[;{}<>"'`\\\n]/;
+/** A token's name as it goes into a class (`2xl`, `red-500`, `0.5`, `--ink`): anything else is never written. */
+const TOKEN_NAME = /^[\w.-]+$/;
+/** Lengths that can't be negative: a negative one is not a declaration, so it isn't written. */
+const UNSIGNED = /^(padding|font-size$|(row-|column-)?gap$|border-.*radius$)/;
+/** Spread props in a tag: they may set what would be added before them. */
+const SPREAD = /\{\s*\.\.\./;
+/** The properties the edit panel sets (tweak.ts), each with its utility's prefix and its tokens' namespace. */
+const UTILS = {
+	"font-size": {
+		prefix: "text",
+		ns: "text",
+		hint: "length"
+	},
+	color: {
+		prefix: "text",
+		ns: "color",
+		hint: "color"
+	},
+	"background-color": {
+		prefix: "bg",
+		ns: "color",
+		hint: "color"
+	},
+	"font-weight": {
+		prefix: "font",
+		ns: "font-weight"
+	},
+	gap: {
+		prefix: "gap",
+		ns: "spacing"
+	},
+	padding: {
+		prefix: "p",
+		ns: "spacing"
+	},
+	"padding-top": {
+		prefix: "pt",
+		ns: "spacing"
+	},
+	"padding-right": {
+		prefix: "pr",
+		ns: "spacing"
+	},
+	"padding-bottom": {
+		prefix: "pb",
+		ns: "spacing"
+	},
+	"padding-left": {
+		prefix: "pl",
+		ns: "spacing"
+	},
+	"padding-inline": {
+		prefix: "px",
+		ns: "spacing"
+	},
+	"padding-block": {
+		prefix: "py",
+		ns: "spacing"
+	},
+	"border-radius": {
+		prefix: "rounded",
+		ns: "radius"
+	},
+	"border-top-left-radius": {
+		prefix: "rounded-tl",
+		ns: "radius"
+	},
+	"border-top-right-radius": {
+		prefix: "rounded-tr",
+		ns: "radius"
+	},
+	"border-bottom-right-radius": {
+		prefix: "rounded-br",
+		ns: "radius"
+	},
+	"border-bottom-left-radius": {
+		prefix: "rounded-bl",
+		ns: "radius"
+	}
+};
+const SIZES = /* @__PURE__ */ new Set([
+	"xs",
+	"sm",
+	"base",
+	"lg",
+	"xl",
+	"2xl",
+	"3xl",
+	"4xl",
+	"5xl",
+	"6xl",
+	"7xl",
+	"8xl",
+	"9xl"
+]);
+/** Tailwind's own names for font weights (font-bold); a site's own come with the change (`names`). */
+const WEIGHT_NAMES = /* @__PURE__ */ new Set([
+	"thin",
+	"extralight",
+	"light",
+	"normal",
+	"medium",
+	"semibold",
+	"bold",
+	"extrabold",
+	"black"
+]);
+/** text-* utilities that are neither a size nor a colour. */
+const TEXT_OTHER = /^text-(left|center|right|justify|start|end|wrap|nowrap|balance|pretty|ellipsis|clip|shadow.*)$/;
+const BG_OTHER = /^bg-(none|fixed|local|scroll|repeat.*|no-repeat|cover|contain|auto|center|top|bottom|left|right|clip-.*|origin-.*|linear-.*|radial.*|conic.*|gradient-.*|blend-.*|size-.*|position-.*|\[url.*)$/;
+/** The Tailwind class for a change, or null when there is no safe one: a property the panel doesn't set, or a value that isn't one plain token. */
+function utilityFor(c) {
+	const u = UTILS[c.prop];
+	if (!u) return null;
+	if (c.token && !TOKEN_NAME.test(c.token.name)) return null;
+	if (c.token?.ns === u.ns) return `${u.prefix}-${c.token.name}`;
+	if (c.token?.ns === "var") return u.hint ? `${u.prefix}-(${u.hint}:${c.token.name})` : `${u.prefix}-(${c.token.name})`;
+	if (c.token) return null;
+	if (c.value === "transparent" && c.prop === "background-color") return "bg-transparent";
+	return /^[\w.#%()-]+$/.test(c.value) ? `${u.prefix}-[${c.value}]` : null;
+}
+/** Whether an (unprefixed) class sets what the change sets, so it has to go. */
+function conflicts(c, cls) {
+	const k = cls.replace(/^!/, "");
+	const names = new Set(c.names ?? []);
+	const isSize = (k2) => {
+		const m = /^text-(.+?)(\/.+)?$/.exec(k2);
+		return !!m && (SIZES.has(m[1]) || names.has(m[1]) || /^\[(length:)?[\d.]+(px|rem|em)\]$/.test(m[1]) || /^\(length:/.test(m[1]));
+	};
+	const u = UTILS[c.prop];
+	switch (c.prop) {
+		case "font-size": return isSize(k);
+		case "color": return /^text-/.test(k) && !isSize(k) && !TEXT_OTHER.test(k);
+		case "background-color": return /^bg-/.test(k) && !BG_OTHER.test(k);
+		case "font-weight": return /^font-/.test(k) && (WEIGHT_NAMES.has(k.slice(5)) || names.has(k.slice(5)) || /^font-\[\d+\]$/.test(k) || /^font-\(weight:/.test(k));
+		case "gap": return /^gap-/.test(k);
+		case "padding": return /^p[xytrblse]?-/.test(k);
+		case "padding-inline": return /^p[xlrse]-/.test(k);
+		case "padding-block": return /^p[ytb]-/.test(k);
+		case "border-radius": return /^rounded($|-)/.test(k);
+	}
+	return !!u && k.startsWith(`${u.prefix}-`);
+}
+/** A class list with the changes' utilities in place of what they replace (in the first one's place), or appended. */
+function editClassList(list, changes) {
+	let classes = list.split(/\s+/).filter(Boolean);
+	for (const c of changes) {
+		const util = utilityFor(c);
+		if (!util) return null;
+		const hit = (k) => !/^[^[]*:/.test(k) && conflicts(c, k);
+		const at = classes.findIndex(hit);
+		classes = at < 0 ? [...classes, util] : classes.flatMap((k, i) => i === at ? [util] : hit(k) ? [] : [k]);
+	}
+	return [...new Set(classes)].join(" ");
+}
+/** Offset of 1-based line and column in text. */
+function offsetOf(text, line, column = 1) {
+	let at = 0;
+	for (let l = 1; l < line; l++) {
+		at = text.indexOf("\n", at) + 1;
+		if (!at) return -1;
+	}
+	return at + column - 1;
+}
+/** The end (after `>`) of the JSX opening tag starting at `start` (`<`), skipping strings and {expressions}. */
+function tagEnd(text, start) {
+	let depth = 0;
+	for (let i = start + 1; i < text.length; i++) {
+		const ch = text[i];
+		if (ch === "\"" || ch === "'" || ch === "`") {
+			const close = text.indexOf(ch, i + 1);
+			if (close < 0) return -1;
+			i = close;
+		} else if (ch === "{") depth++;
+		else if (ch === "}") depth--;
+		else if (ch === ">" && depth === 0) return i + 1;
+	}
+	return -1;
+}
+/** An attribute of the tag text: where it is, and its value when it is a plain string (`a="x"`, `a={'x'}`, a template without `${}`). */
+function attrOf(tag, name) {
+	const re = new RegExp(`\\s${name}\\s*=\\s*`, "g");
+	const hits = [...tag.matchAll(re)].filter((m) => tagDepth(tag, m.index) === 0);
+	if (hits.length !== 1) return null;
+	const m = hits[0];
+	const vs = m.index + m[0].length;
+	const q = tag[vs];
+	if (q === "\"" || q === "'") {
+		const ve = tag.indexOf(q, vs + 1);
+		return {
+			start: m.index,
+			end: ve + 1,
+			value: {
+				start: vs + 1,
+				end: ve,
+				text: tag.slice(vs + 1, ve)
+			},
+			literal: true
+		};
+	}
+	if (q === "{") {
+		const close = braceEnd(tag, vs);
+		if (close < 0) return null;
+		const inner = tag.slice(vs + 1, close);
+		const lit = /^\s*(["'`])([^"'`\\]*)\1\s*$/.exec(inner);
+		if (!lit || lit[1] === "`" && lit[2].includes("${")) return {
+			start: m.index,
+			end: close + 1,
+			value: null,
+			literal: false
+		};
+		const s = vs + 1 + inner.indexOf(lit[1]) + 1;
+		return {
+			start: m.index,
+			end: close + 1,
+			value: {
+				start: s,
+				end: s + lit[2].length,
+				text: lit[2]
+			},
+			literal: true
+		};
+	}
+	return null;
+}
+/** The `}` closing the `{` at `open`, skipping strings. */
+function braceEnd(text, open) {
+	let depth = 0;
+	for (let i = open; i < text.length; i++) {
+		const ch = text[i];
+		if (ch === "\"" || ch === "'" || ch === "`") {
+			i = text.indexOf(ch, i + 1);
+			if (i < 0) return -1;
+		} else if (ch === "{") depth++;
+		else if (ch === "}" && --depth === 0) return i;
+	}
+	return -1;
+}
+/** How deep in {expressions} an offset of the tag text is. */
+function tagDepth(tag, at) {
+	let depth = 0;
+	for (let i = 0; i < at; i++) {
+		const ch = tag[i];
+		if (ch === "\"" || ch === "'" || ch === "`") {
+			const close = tag.indexOf(ch, i + 1);
+			if (close < 0) break;
+			i = close;
+		} else if (ch === "{") depth++;
+		else if (ch === "}") depth--;
+	}
+	return depth;
+}
+/** Writes the changes as utilities into the class list of the tag at `start`. */
+function editClassName(text, start, changes) {
+	if (text[start] !== "<") return null;
+	const end = tagEnd(text, start);
+	if (end < 0) return null;
+	const tag = text.slice(start, end);
+	const a = attrOf(tag, "className") ?? attrOf(tag, "class");
+	if (a && !a.literal) return null;
+	if (a?.value) {
+		const next = editClassList(a.value.text, changes);
+		if (next === null) return null;
+		return text.slice(0, start + a.value.start) + next + text.slice(start + a.value.end);
+	}
+	const name = /^<([\w.-]+)/.exec(tag);
+	const list = editClassList("", changes);
+	if (!name || list === null || /^[A-Z]/.test(name[1]) || SPREAD.test(tag)) return null;
+	const at = start + name[0].length;
+	return `${text.slice(0, at)} className="${list}"${text.slice(at)}`;
+}
+/** Sets a component's string prop where it is rendered: `<Name` on `line`, nearest `column`. */
+function editProp(text, line, column, name, prop, value) {
+	if (!/^[\w$.]+$/.test(name) || !/^[\w-]+$/.test(prop) || UNSAFE_VALUE.test(value)) return null;
+	const from = offsetOf(text, line);
+	const to = text.indexOf("\n", from);
+	const lineText = text.slice(from, to < 0 ? void 0 : to);
+	const short = name.split(".").pop();
+	const starts = [...lineText.matchAll(new RegExp(`<(?:[\\w$]+\\.)*${short}(?=[\\s/>])`, "g"))].map((m) => from + m.index);
+	if (!starts.length || starts.length > 1 && column === void 0) return null;
+	const start = starts.sort((a, b) => Math.abs(a - from - (column ?? 1) + 1) - Math.abs(b - from - (column ?? 1) + 1))[0];
+	const end = tagEnd(text, start);
+	if (end < 0) return null;
+	const tag = text.slice(start, end);
+	const a = attrOf(tag, prop);
+	if (a && !a.value) return null;
+	if (a?.value) return text.slice(0, start + a.value.start) + value + text.slice(start + a.value.end);
+	if (SPREAD.test(tag)) return null;
+	const at = start + /^<[\w$.]+/.exec(tag)[0].length;
+	return `${text.slice(0, at)} ${prop}="${value}"${text.slice(at)}`;
+}
+/** A selector compared loosely: one space, none around combinators and commas. */
+const normSelector = (s) => s.replace(/\s+/g, " ").replace(/\s*([>+~,])\s*/g, "$1").trim();
+const LONGHANDS = {
+	padding: /^padding-/,
+	"padding-inline": /^padding-(left|right|inline-start|inline-end)$/,
+	"padding-block": /^padding-(top|bottom|block-start|block-end)$/,
+	gap: /^(row|column)-gap$/,
+	"border-radius": /^border-.+-radius$/
+};
+/** A property and the shorthands that set it too: one later in the block overrides a value replaced in place. */
+const SHORTHANDS = [
+	[/^padding-(top|bottom)$/, /^padding(-block)?$/],
+	[/^padding-(left|right)$/, /^padding(-inline)?$/],
+	[/^padding-(inline|block)$/, /^padding$/],
+	[/^font-(size|weight)$/, /^font$/],
+	[/^background-color$/, /^background$/],
+	[/^border-.+-radius$/, /^border-radius$/],
+	[/^(row|column)-gap$/, /^gap$/]
+];
+/**
+* Sets `prop: value` in the top-level rule with exactly this selector: its declaration replaced in place, or added at
+* the end of the block in the block's own format. Null when the rule isn't there exactly once, nests rules, sets a
+* longhand of the property (which a new shorthand would not override in place), or sets a shorthand of it after the
+* declaration to replace (which would override it). Comments in the block are not declarations.
+*/
+function editRule(css, selector, prop, value) {
+	const want = normSelector(selector);
+	const blocks = [];
+	let depth = 0, from = 0, open = -1;
+	for (let i = 0; i < css.length; i++) {
+		const ch = css[i];
+		if (ch === "/" && css[i + 1] === "*") {
+			i = css.indexOf("*/", i + 2) + 1;
+			if (i <= 0) return null;
+			if (depth === 0) from = i + 1;
+		} else if (ch === "\"" || ch === "'") {
+			i = css.indexOf(ch, i + 1);
+			if (i < 0) return null;
+		} else if (ch === "{") {
+			if (depth === 0 && normSelector(css.slice(from, i)) === want) open = i;
+			depth++;
+		} else if (ch === "}") {
+			depth--;
+			if (depth === 0) {
+				if (open >= 0) blocks.push({
+					open,
+					close: i
+				}), open = -1;
+				from = i + 1;
+			}
+		} else if (ch === ";" && depth === 0) from = i + 1;
+	}
+	if (blocks.length !== 1) return null;
+	const { open: o, close } = blocks[0];
+	const body = css.slice(o + 1, close);
+	if (body.includes("{")) return null;
+	const bare = body.replace(/\/\*[\s\S]*?\*\//g, (m) => " ".repeat(m.length));
+	const decls = [...bare.matchAll(/([\w-]+)\s*:\s*([^;]*?)(\s*!important)?\s*(;|$)/g)];
+	if (decls.some((d) => LONGHANDS[prop]?.test(d[1]))) return null;
+	const same = decls.filter((d) => d[1] === prop);
+	if (same.length) {
+		const d = same.at(-1);
+		const short = SHORTHANDS.find(([p]) => p.test(prop))?.[1];
+		if (short && decls.slice(decls.indexOf(d) + 1).some((x) => short.test(x[1]))) return null;
+		const vs = o + 1 + d.index + d[0].indexOf(d[2], d[1].length);
+		return css.slice(0, vs) + value + css.slice(vs + d[2].length);
+	}
+	if (body.includes("\n")) {
+		const last = decls.at(-1);
+		const indent = /\n([ \t]*)\S/.exec(body)?.[1] ?? "  ";
+		const at = last ? o + 1 + last.index + last[0].trimEnd().length : o + 1;
+		const semi = last && !last[0].trimEnd().endsWith(";") ? ";" : "";
+		return `${css.slice(0, at)}${semi}\n${indent}${prop}: ${value};${css.slice(at)}`;
+	}
+	const trimmed = body.trimEnd();
+	const semi = bare.trim() && !bare.trimEnd().endsWith(";") ? ";" : "";
+	const at = o + 1 + trimmed.length;
+	return `${css.slice(0, at)}${semi} ${prop}: ${value};${css.slice(at)}`;
+}
+/** `file:line:col` (relative to the dev server root) as an absolute location. */
+function stampLoc(root, stamp) {
+	const m = stamp && /^(.*):(\d+):(\d+)$/.exec(stamp);
+	return m ? {
+		file: path.resolve(root, m[1]),
+		line: +m[2],
+		column: +m[3]
+	} : null;
+}
+/** The stylesheet a rule came from: Vite's `data-vite-dev-id` (an absolute path) or its URL's path from the root. */
+function sheetFile(root, sheet) {
+	if (!sheet) return null;
+	const clean = sheet.replace(/[?#].*$/, "");
+	if (path.isAbsolute(clean) && fs.existsSync(clean)) return clean;
+	try {
+		const p = decodeURIComponent(new URL(clean, "http://x").pathname).replace(/^\/@fs/, "");
+		for (const f of [p, path.join(root, p)]) if (fs.existsSync(f)) return f;
+	} catch {}
+	return null;
+}
+/**
+* Plans every change of the edit on the files' text, then writes them all as the comment's change, through the same
+* path as the session's edits. Nothing is written when any change can't be.
+*/
+function applyStyleEdit(cl, e) {
+	const p = e.payload;
+	const styles = Array.isArray(p.styles) ? p.styles : [];
+	if (!styles.length) return {
+		ok: false,
+		reason: "no style change"
+	};
+	const root = typeof p.target.root === "string" && p.target.root ? p.target.root : cl.top;
+	const texts = /* @__PURE__ */ new Map();
+	const load = (file) => {
+		let real;
+		try {
+			real = fs.realpathSync(file);
+		} catch {
+			return null;
+		}
+		if (!cl.editable([real]).size) return null;
+		if (!texts.has(real)) texts.set(real, fs.readFileSync(real, "utf8"));
+		return real;
+	};
+	for (const c of styles) {
+		if (c.prop !== "variant" && (!PROP.test(c.prop) || UNSAFE_VALUE.test(c.value))) return {
+			ok: false,
+			reason: `can't write ${c.label}`
+		};
+		if (UNSIGNED.test(c.prop) && c.value.trim().startsWith("-")) return {
+			ok: false,
+			reason: `${c.label} can't be negative`
+		};
+		if (c.prop === "variant" && !c.value) return {
+			ok: false,
+			reason: `${c.label} back to its default needs the session`
+		};
+	}
+	for (const c of styles.filter((x) => x.prop === "variant")) {
+		const usage = p.target.source.find((s) => s.role === "usage");
+		const prop = c.names?.[0];
+		const file = usage && load(path.resolve(cl.top, usage.file));
+		if (!file || !prop || !p.target.component) return {
+			ok: false,
+			reason: `no place to set ${c.label}`
+		};
+		const next = editProp(texts.get(file), usage.line, usage.column, p.target.component, prop, c.value);
+		if (next === null) return {
+			ok: false,
+			reason: `${prop} isn't a plain prop where ${p.target.component} is rendered`
+		};
+		texts.set(file, next);
+	}
+	const css = styles.filter((x) => x.prop !== "variant");
+	if (css.length) {
+		const loc = stampLoc(root, css[0].stamp);
+		const jsx = loc && p.system === "tailwind" ? load(loc.file) : null;
+		let done = false;
+		if (jsx && loc) {
+			const text = texts.get(jsx);
+			const next = editClassName(text, offsetOf(text, loc.line, loc.column), css);
+			if (next !== null) texts.set(jsx, next), done = true;
+		}
+		if (!done) for (const c of css) {
+			const file = c.rule && sheetFile(root, c.rule.sheet);
+			const real = file && load(file);
+			if (!real || !c.rule) return {
+				ok: false,
+				reason: `no stylesheet rule only this element uses for ${c.label}`
+			};
+			const next = editRule(texts.get(real), c.rule.selector, c.prop, c.value);
+			if (next === null) return {
+				ok: false,
+				reason: `the rule ${c.rule.selector} isn't in ${cl.relPath(real) ?? real} exactly once`
+			};
+			texts.set(real, next);
+		}
+	}
+	const agent = `bridge-${e.taskId}`;
+	const changed = [...texts.entries()].filter(([f, t]) => fs.readFileSync(f, "utf8") !== t);
+	if (!changed.length) return {
+		ok: false,
+		reason: "nothing to change"
+	};
+	cl.begin(e.taskId, agent, e.comment);
+	for (const [file, text] of changed) try {
+		cl.recordEdit(agent, file);
+		fs.writeFileSync(file, text);
+	} finally {
+		cl.finishEdit(agent, file);
+	}
+	if (!cl.finishTask(agent)?.files.length) return {
+		ok: false,
+		reason: "the files changed while writing"
+	};
+	return {
+		ok: true,
+		files: changed.map(([f]) => cl.relPath(f) ?? f)
+	};
+}
+const str = (v, max) => typeof v === "string" && v.length <= max ? v : void 0;
+/** The style changes as the page sent them, kept to plain strings of sane length: everything here comes from the page. */
+function cleanStyles(v) {
+	if (!Array.isArray(v)) return void 0;
+	const out = [];
+	for (const c of v.slice(0, 30)) {
+		const prop = str(c?.prop, 40);
+		const value = str(c?.value, 300);
+		if (!prop || !/^[a-z-]+$/.test(prop) || value === void 0) continue;
+		const token = str(c.token?.ns, 40) && str(c.token?.name, 120) ? {
+			ns: c.token.ns,
+			name: c.token.name
+		} : void 0;
+		const names = Array.isArray(c.names) ? c.names.flatMap((n) => str(n, 60) ?? []).slice(0, 80) : void 0;
+		const selector = str(c.rule?.selector, 500);
+		out.push({
+			prop,
+			value,
+			label: str(c.label, 60) ?? prop,
+			from: str(c.from, 120) ?? "",
+			to: str(c.to, 120) ?? value,
+			computed: str(c.computed, 200),
+			token,
+			names,
+			rule: selector ? {
+				selector,
+				sheet: str(c.rule.sheet, 1e3)
+			} : void 0,
+			stamp: str(c.stamp, 1e3)
+		});
+	}
+	return out.length ? out : void 0;
+}
+/** The changes as the session's brief lists them: in the system's words, then what to write and what the page computed. */
+function styleLines(styles) {
+	return styles.map((c) => {
+		if (c.prop === "variant") return `- ${c.label}: ${c.from} → ${c.to} (the ${c.names?.[0] ?? "variant"} prop where the component is rendered)`;
+		const rule = c.rule ? `; the page styles it with \`${c.rule.selector}\`` : "";
+		return `- ${c.label}: ${c.from} → ${c.to} (${c.prop}: ${c.value}${c.computed && c.computed !== c.value ? `, computed ${c.computed}` : ""}${rule})`;
+	}).join("\n");
 }
 // packages/claude-plugin/src/ws.ts
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -14641,6 +15430,8 @@ function touch(v) {
 }
 /** Attempts per comment: the first change, plus one fix attempt when the page shows errors. */
 const MAX_ATTEMPTS = 2;
+/** Changes the bridge writes itself when it can, without the session's model. */
+const DIRECT = ["exact-edit", "style-edit"];
 /** The active id while the session names the Pull request's branch and opens the pull request. */
 const PR = "pull-request";
 /** The active id while the session fixes an error the page showed (Fix in Claude). */
@@ -15155,9 +15946,11 @@ var Bridge = class {
 			}
 			if (msg.type === "sync") this.sync(conn);
 			else if (msg.type === "comment") this.addComment(msg.payload, conn.origin);
-			else if (msg.type === "text-edit") this.addTextEdit(msg.payload, conn.origin);
+			else if (msg.type === "text-edit") this.addDirect(msg.payload, "exact-edit", conn.origin);
+			else if (msg.type === "style-edit") this.addDirect(msg.payload, "style-edit", conn.origin);
 			else if (msg.type === "verified") this.verified(msg.id, msg.attempt, msg);
 			else if (msg.type === "release") this.answerHeld(msg.apply, msg.discard);
+			else if (msg.type === "dismiss") this.dismiss(msg.id);
 			else if (msg.type === "undo" || msg.type === "redo") {
 				const text = this.history(msg.type, msg.sha);
 				this.send({
@@ -15204,7 +15997,7 @@ var Bridge = class {
 	}
 	sync(conn) {
 		this.markReverted();
-		const comments = [...this.comments.values()].map((c) => c.record);
+		const comments = [...this.comments.values()].filter((c) => !c.record.dismissed).map((c) => c.record);
 		this.send({
 			type: "comments",
 			sessionId: this.sessionId,
@@ -15242,7 +16035,7 @@ var Bridge = class {
 			const c = this.comments.get(id);
 			if (!c?.record.held) continue;
 			c.record.held = void 0;
-			if (c.record.payload.kind === "exact-edit" && this.listening && this.writeText(c)) continue;
+			if (DIRECT.includes(c.record.payload.kind) && this.listening && this.writeDirect(c)) continue;
 			this.enqueue(c, "comment");
 		}
 		this.reorder();
@@ -15254,6 +16047,17 @@ var Bridge = class {
 		if (dropped.length) this.send({
 			type: "dropped",
 			ids: dropped
+		});
+	}
+	/** The × on a failed comment: it stays in the inbox, marked dismissed, and goes from every page. */
+	dismiss(id) {
+		const c = this.comments.get(id);
+		if (!c || c.phase !== "settled" || c.record.status !== "failed" || c.record.dismissed) return;
+		c.record.dismissed = true;
+		this.persist(c);
+		this.send({
+			type: "dropped",
+			ids: [id]
 		});
 	}
 	/** Registers a comment and saves its screenshot. Returns null when it is already known. */
@@ -15291,6 +16095,8 @@ var Bridge = class {
 			screenshot: null
 		};
 		payload.target = target;
+		payload.styles = payload.kind === "exact-edit" ? void 0 : cleanStyles(payload.styles);
+		payload.system = payload.system === "tailwind" ? "tailwind" : payload.system === "css" ? "css" : void 0;
 		let shot = null;
 		if (screenshot?.startsWith("data:image/png;base64,")) {
 			shot = path.join(this.cl.dir, "screenshots", `${payload.id.replace(/[^\w-]/g, "_")}.png`);
@@ -15392,21 +16198,22 @@ var Bridge = class {
 		this.enqueue(c, "comment");
 	}
 	/**
-	* A text edited in place. With a listening session, the bridge writes it itself when it finds the
-	* old text exactly once near the target's source; otherwise the session gets it as an exact edit,
-	* since the text may come from a translation backend, data or user input.
+	* A change the bridge can write itself: a text edited in place (when it finds the old text exactly once near the
+	* target's source) or the edit panel's params (when each has one place to go, style-edit.ts). Otherwise the session
+	* gets it, since the text may come from data, or the style from a class list built at runtime. Either way it needs a
+	* listening session, as every change does.
 	*/
-	async addTextEdit(payload, origin) {
-		if (this.comments.has(payload.id)) return;
+	async addDirect(payload, kind, origin) {
+		if (this.comments.has(payload.id) || payload.kind !== kind) return;
 		await this.resolveSource(payload, origin);
 		const c = this.register(payload);
 		if (!c) return;
 		if (!this.listening) c.record.held = true;
-		else if (this.writeText(c)) return;
+		else if (this.writeDirect(c)) return;
 		this.enqueue(c, "comment");
 	}
 	/** Tries the direct write. True when the bridge wrote it and the comment now waits for the page. */
-	writeText(c) {
+	writeDirect(c) {
 		const p = c.record.payload;
 		if (this.cl.blocked() || this.checkoutBusy()) return false;
 		c.record.branch = this.cl.branch();
@@ -15416,22 +16223,52 @@ var Bridge = class {
 		c.phase = "working";
 		this.setStatus(c, "working");
 		const t0 = performance.now();
-		const r = applyTextEdit(this.cl, {
-			taskId: p.id,
-			from: p.values?.from ?? "",
-			to: p.values?.to ?? "",
-			files: [...p.target.source.map((s) => s.file), ...p.target.context ?? []],
-			comment: {
-				id: p.id,
-				text: p.text,
-				kind: p.kind,
-				values: p.values
-			}
-		});
+		const v = p.values ?? {};
+		const comment = {
+			id: p.id,
+			text: p.text,
+			kind: p.kind,
+			values: p.values
+		};
+		const direct = () => {
+			if (p.kind === "style-edit") return applyStyleEdit(this.cl, {
+				taskId: p.id,
+				payload: p,
+				comment
+			});
+			const at = p.target.source.find((s) => s.via === "data-stift-src" && s.role === "element" && s.column);
+			const t = typeof v.markup === "string" && typeof v.was === "string" ? at ? applyMarkupEdit(this.cl, {
+				taskId: p.id,
+				file: at.file,
+				line: at.line,
+				column: at.column,
+				tag: /^<([a-z][\w-]*)/.exec(p.target.domSnippet ?? "")?.[1],
+				was: v.was,
+				markup: v.markup,
+				comment
+			}) : {
+				ok: false,
+				reason: "no source location for the element",
+				searched: 0
+			} : applyTextEdit(this.cl, {
+				taskId: p.id,
+				from: v.from ?? "",
+				to: v.to ?? "",
+				files: [...p.target.source.map((s) => s.file), ...p.target.context ?? []],
+				comment
+			});
+			return t.ok ? {
+				ok: true,
+				files: [t.file],
+				searched: t.searched
+			} : t;
+		};
+		const r = direct();
 		const ms = Math.round(performance.now() - t0);
+		const searched = r.searched === void 0 ? null : `${r.searched} files searched`;
 		if (r.ok) {
-			c.record.files = [r.file];
-			c.record.notes = [`Written by stift in ${ms} ms (${r.searched} files searched).`];
+			c.record.files = r.files;
+			c.record.notes = [`Written by stift in ${ms} ms${searched ? ` (${searched})` : ""}.`];
 			c.phase = "arriving";
 			this.setStatus(c, "arriving");
 			this.sendTouched(p.id);
@@ -15439,7 +16276,7 @@ var Bridge = class {
 			this.kick();
 			return true;
 		}
-		c.record.notes = [`Sent to Claude Code: ${r.reason} (${r.searched} files searched in ${ms} ms).`];
+		c.record.notes = [`Sent to Claude Code: ${r.reason} (${searched ? `${searched} in ` : ""}${ms} ms).`];
 		c.attempt = 0;
 		return false;
 	}
@@ -15791,7 +16628,7 @@ var Bridge = class {
 		if (!c) throw new Error(`No comment ${id}.`);
 		const p = c.record.payload;
 		if (c.next === "fix") return fixPrompt(p, c.record.files ?? [], c.errors, c.attached ?? []);
-		const brief = p.kind === "exact-edit" ? exactEditPrompt(p) : p.values?.replace === "image" ? replaceImagePrompt(p, c.attached ?? []) : commentPrompt(p, c.attached ?? []);
+		const brief = p.kind === "exact-edit" ? exactEditPrompt(p) : p.kind === "style-edit" ? styleEditPrompt(p) : p.values?.replace === "image" ? replaceImagePrompt(p, c.attached ?? []) : commentPrompt(p, c.attached ?? []);
 		return c.failedBefore ? `${brief}\n\nAn earlier attempt at this failed, and the user asked you to try again: ${pageData(c.failedBefore)}\nAddress that this time.` : brief;
 	}
 	/**
@@ -16192,7 +17029,9 @@ function where(target, extra = []) {
 const RULES = (id) => `Edit files with the Edit or Write tools (stift records those) and don't run git. If it can't be done in this repository's code, call report_comment with id ${JSON.stringify(id)}, status "failed" and a short reason.`;
 function commentPrompt(p, attached) {
 	return `Comment on the running app: ${JSON.stringify(p.text)}
-Where: ${where(p.target)}${attachedLine(attached, p.id)}
+Where: ${where(p.target)}${attachedLine(attached, p.id)}${p.styles?.length ? `
+With it, the user restyled the element with stift's edit controls (the page shows it already). Write these too, in the project's own way (${p.system === "tailwind" ? "Tailwind utilities in its class list" : "its stylesheet"}, with the design tokens named), to this element only, unless the comment says otherwise:
+${pageData(styleLines(p.styles))}` : ""}
 
 ${RULES(p.id)}`;
 }
@@ -16258,6 +17097,17 @@ The outcome: a new branch from HEAD with these commits, ${p.reset ? `${p.from} r
 3. Call report_pull_request with its url. If you can't open it (no tool, not logged in), call report_pull_request with error and one short reason: stift then puts everything back as it was.
 
 Don't change files, commit, push, switch branches or reset anything yourself.`;
+}
+/**
+* The edit panel's params, when the bridge couldn't write them itself: what changed in the system's words, and the
+* values the page showed, for the session to write in the project's own way.
+*/
+function styleEditPrompt(p) {
+	return `The user restyled an element on the running app with stift's edit panel (the page shows it already). Write these changes in the project's own way (${p.system === "tailwind" ? "Tailwind utilities in its class list" : "its stylesheet"}, with the design tokens named), to this element only: where it's rendered from a list or a component, that's every instance of it, but not other elements that share its classes:
+${pageData(styleLines(p.styles ?? []))}
+Where: ${where(p.target, p.target.context ?? [])}
+
+${RULES(p.id)}`;
 }
 function exactEditPrompt(p) {
 	return `The user changed text on the running app to ${JSON.stringify(p.values?.to ?? "")}. Old text ${pageData(JSON.stringify(p.values?.from ?? ""))}
